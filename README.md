@@ -1,7 +1,3 @@
-Aquí tienes una **nueva versión completa** de `README.md`, coherente con el repo tal como está empaquetado (CLI `molde-maestro`, `pyproject.toml`, código en `src/…`) y con **instalación usando `uv`**. Basada en tu README actual, corrigiendo inconsistencias y manteniendo el contenido útil. fileciteturn0file0L1-L200
-
----
-
 # molde_maestro
 
 `molde_maestro` es un pipeline reproducible para **mejorar repositorios** usando:
