@@ -10,13 +10,3 @@ lint_cmd: "ruff check . || true"
 
 max_iters: 2
 zip: true
-
-# opcional
-extra_context:
-  - README.md
-  - pyproject.toml
-
-# opcional (si quieres restringir lo que Aider toca)
-allowed_files: []
-# - src/core.py
-# - tests/test_core.py
