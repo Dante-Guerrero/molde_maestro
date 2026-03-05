@@ -109,6 +109,152 @@ También soporta claves con guiones (`max-iters`) y las normaliza a guion bajo.
 
 ## Uso rápido
 
+## Primeros pasos (en 5 minutos)
+
+Este proyecto asume dos cosas:
+1) Tienes un **repo objetivo** (el que quieres mejorar) que es un repo git real.
+2) Tienes instalados los “obreros” del pipeline: **Ollama** (para el razonador) y **Aider** (para aplicar cambios).
+
+### 0) Instala herramientas (una vez)
+
+- **Ollama**: instala Ollama y descarga tus modelos (ej: `deepseek-r1` y `qwen3-coder:14b`).
+- **Aider**: instala Aider y asegúrate de que el comando `aider` funcione en tu terminal.
+- (Opcional) **PyYAML** si usarás config en YAML:
+  ```bash
+  pip install pyyaml
+  ```
+
+### 1) Prepara el repo objetivo
+
+En la raíz del repo objetivo, crea/edita:
+
+- `PROJECT_GOALS.md` (obligatorio, si quieres que el reporte final tenga sentido)
+
+Ejemplo mínimo:
+- No romper API pública
+- Mejorar cobertura de tests
+- Reducir errores en módulo X
+
+### 2) Crea la configuración del pipeline
+
+En este repo (`molde_maestro/`), crea `molde_maestro.yml` (o `.json`) y apunta `repo:` al repo objetivo.
+
+Ejemplo si ambos repos viven en la misma carpeta padre:
+
+```yaml
+repo: ../exam_pipeline_starter
+goals: PROJECT_GOALS.md
+ai_dir: AI
+
+reasoner: "ollama:deepseek-r1"
+aider_model: "ollama:qwen3-coder:14b"
+
+test_cmd: "pytest -q"
+lint_cmd: "ruff check . || true"
+
+max_iters: 2
+zip: true
+```
+
+### 3) Ejecuta
+
+Desde la raíz de `molde_maestro/`:
+
+```bash
+python pipeline.py
+```
+
+Si existe `molde_maestro.yml/.yaml/.json`, el script asume `run` automáticamente.
+
+### 4) Revisa resultados (en el repo objetivo)
+
+El pipeline escribe todo dentro del repo objetivo:
+
+- `AI/plan.md` (plan de cambios)
+- `AI/test-report.md` (salida de tests/lint)
+- `AI/final.md` (conclusiones vs objetivos)
+
+y crea una rama tipo `ai/<timestamp>-improvements` en el repo objetivo. Revisa el diff y los reportes antes de mergear.
+
+---
+
+
+## Ejecutar el pipeline sobre OTRO repositorio (caso típico)
+
+Puedes mantener este repo (`molde_maestro/`) como “motor” y ejecutar el pipeline sobre un repo objetivo distinto (por ejemplo `exam_pipeline_starter/`).
+
+### Estructura recomendada de carpetas
+
+Asumiendo que ambos repos viven en la misma carpeta padre:
+
+```text
+<carpeta_padre>/
+├─ molde_maestro/
+│  ├─ pipeline.py
+│  ├─ molde_maestro.yml
+│  └─ README.md
+│
+└─ exam_pipeline_starter/
+   ├─ .git/
+   ├─ PROJECT_GOALS.md
+   ├─ README.md
+   ├─ pyproject.toml          (o requirements.txt / package.json, según stack)
+   ├─ src/                    (o app/, etc.)
+   ├─ tests/                  (si existe)
+   └─ AI/                     (se crea cuando corras el pipeline)
+      ├─ plan.md
+      ├─ aider-log.txt
+      ├─ test-report.md
+      ├─ test-report.json
+      ├─ final.md
+      └─ snapshots/
+         └─ 20260305-123456.zip   (si zip=true)
+```
+
+### Cómo configurar `molde_maestro.yml` para apuntar al repo objetivo
+
+En `molde_maestro/molde_maestro.yml`, ajusta `repo:` para que apunte al repo objetivo.  
+En el ejemplo de arriba, desde `molde_maestro/` el repo objetivo queda en `../exam_pipeline_starter`:
+
+```yaml
+repo: ../exam_pipeline_starter
+goals: PROJECT_GOALS.md
+ai_dir: AI
+
+reasoner: "ollama:deepseek-r1"
+aider_model: "ollama:qwen3-coder:14b"
+
+test_cmd: "pytest -q"
+lint_cmd: "ruff check . || true"
+
+max_iters: 2
+zip: true
+```
+
+**Importante:** `goals:` se resuelve dentro del repo objetivo. Es decir, este ejemplo espera que exista:
+- `exam_pipeline_starter/PROJECT_GOALS.md`
+
+### Paso a paso (ejecución real)
+
+1) Crea/edita `PROJECT_GOALS.md` en el repo objetivo (`exam_pipeline_starter/`).
+2) En `molde_maestro.yml`, apunta `repo:` al repo objetivo (ej: `../exam_pipeline_starter`).
+3) Ejecuta desde `molde_maestro/`:
+
+```bash
+cd /ruta/a/molde_maestro
+python pipeline.py
+```
+
+4) Revisa artefactos y resultados en el repo objetivo:
+- `exam_pipeline_starter/AI/plan.md`
+- `exam_pipeline_starter/AI/test-report.md`
+- `exam_pipeline_starter/AI/final.md`
+
+Y revisa la rama creada en el repo objetivo (ej: `ai/<timestamp>-improvements`) antes de mergear.
+
+---
+
+
 ### 1) Crea tus objetivos
 En la raíz del repo:
 - `PROJECT_GOALS.md`

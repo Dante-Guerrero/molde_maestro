@@ -1,7 +1,10 @@
-repo: .
+
+# Información del repositorio objetivo:
+repo: . 
 goals: PROJECT_GOALS.md
 ai_dir: AI
 
+# Información de los modelos a utilizar:
 reasoner: "ollama:deepseek-r1"
 aider_model: "ollama:qwen3-coder:14b"
 

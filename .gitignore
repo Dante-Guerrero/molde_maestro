@@ -1,0 +1,44 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Virtual envs ---
+.venv/
+venv/
+ENV/
+env/
+
+# --- Packaging / build ---
+build/
+dist/
+*.egg-info/
+.eggs/
+.wheels/
+pip-wheel-metadata/
+*.whl
+
+# --- Tooling caches ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.pytype/
+.pyre/
+
+# --- OS / editor ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# --- Logs / temp ---
+*.log
+*.tmp
+
+# --- Project artifacts (your pipeline outputs) ---
+AI/
+snapshots/
