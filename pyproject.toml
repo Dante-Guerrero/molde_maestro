@@ -10,3 +10,6 @@ dependencies = [
 
 [project.scripts]
 molde-maestro = "molde_maestro.pipeline:main"
+
+[tool.uv]
+package = true
