@@ -1,0 +1,22 @@
+repo: .
+goals: PROJECT_GOALS.md
+ai_dir: AI
+
+reasoner: "ollama:deepseek-r1"
+aider_model: "ollama:qwen3-coder:14b"
+
+test_cmd: "pytest -q"
+lint_cmd: "ruff check . || true"
+
+max_iters: 2
+zip: true
+
+# opcional
+extra_context:
+  - README.md
+  - pyproject.toml
+
+# opcional (si quieres restringir lo que Aider toca)
+allowed_files: []
+# - src/core.py
+# - tests/test_core.py
