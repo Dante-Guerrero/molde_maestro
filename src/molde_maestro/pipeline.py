@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import builtins
 import contextlib
 import dataclasses
 import datetime as dt
@@ -581,6 +582,11 @@ def merge_config_into_args(args: argparse.Namespace, cfg: dict) -> argparse.Name
         "apply_limit_to_plan_files": "apply_limit_to_plan_files",
         "apply_enforce_plan_scope": "apply_enforce_plan_scope",
         "apply_skip_unsupported_plan_changes": "apply_skip_unsupported_plan_changes",
+        "semantic_validation": "semantic_validation",
+        "validation_profile": "validation_profile",
+        "semantic_validation_mode": "semantic_validation_mode",
+        "semantic_validation_strict": "semantic_validation_strict",
+        "semantic_validation_timeout": "semantic_validation_timeout",
     }
 
     for ck, af in mappings.items():
@@ -594,6 +600,8 @@ def merge_config_into_args(args: argparse.Namespace, cfg: dict) -> argparse.Name
             default_strings = {
                 "plan_mode": "balanced",
                 "plan_fallback_reasoner": "",
+                "validation_profile": "auto",
+                "semantic_validation_mode": "auto",
             }
             if not str(cur).strip() or (af in default_strings and cur == default_strings[af]):
                 set_(af, str(val))
@@ -617,6 +625,7 @@ def merge_config_into_args(args: argparse.Namespace, cfg: dict) -> argparse.Name
                 "plan_max_changes": 0,
                 "plan_fallback_timeout": 0,
                 "apply_max_plan_changes": 0,
+                "semantic_validation_timeout": 60,
             }
             if af in defaults and cur == defaults[af]:
                 set_(af, int(val))
@@ -673,6 +682,61 @@ class ApplyScope:
     max_changes: int
     source: str
     skipped_change_titles: List[str]
+
+
+@dataclasses.dataclass
+class FunctionSignature:
+    name: str
+    required_positional: int
+    max_positional: Optional[int]
+    keyword_only_required: List[str]
+
+
+@dataclasses.dataclass
+class ValidationContext:
+    is_python_repo: bool
+    has_tests: bool
+    has_pyproject: bool
+    has_requirements: bool
+    has_src_dir: bool
+    has_main_py: bool
+    has_dot_venv: bool
+    has_uv_lock: bool
+    has_setup_cfg: bool
+    python_runner: Optional[str]
+    python_runner_source: str
+    runner_reproducible: bool
+    runner_usable: bool
+    pytest_available: bool
+    pytest_command: str
+    compile_command: str
+    repo_notes: List[str]
+    suggested_profile: str
+    suggestion_reason: str
+    promotion_reasons: List[str]
+    promotion_blockers: List[str]
+
+
+@dataclasses.dataclass
+class ValidationPlan:
+    profile: str
+    source: str
+    suggested_profile: str
+    suggestion_reason: str
+    promotion_decision: str
+    promotion_reasons: List[str]
+    promotion_blockers: List[str]
+    test_command: str
+    lint_command: Optional[str]
+    semantic_validation: bool
+    semantic_validation_mode: str
+    semantic_validation_strict: bool
+    semantic_validation_timeout: int
+    smoke_imports: bool
+    smoke_imports_strict: bool
+    smoke_import_runner: Optional[str]
+    checks: List[Dict[str, Any]]
+    context: ValidationContext
 
 
 def parse_model_spec(s: str) -> ModelSpec:
@@ -786,6 +850,346 @@ def audit_python_dependency_declarations(repo: Path, changed_files: List[str]) -
         if missing:
             issues.append({"file": rel_path, "missing_dependencies": missing})
     return {"ok": not issues, "issues": issues}
+
+
+def build_function_signature(node: ast.FunctionDef | ast.AsyncFunctionDef) -> FunctionSignature:
+    positional = len(node.args.posonlyargs) + len(node.args.args)
+    defaults = len(node.args.defaults)
+    required_positional = max(0, positional - defaults)
+    max_positional = None if node.args.vararg else positional
+    keyword_only_required = [
+        arg.arg for arg, default in zip(node.args.kwonlyargs, node.args.kw_defaults) if default is None
+    ]
+    return FunctionSignature(
+        name=node.name,
+        required_positional=required_positional,
+        max_positional=max_positional,
+        keyword_only_required=keyword_only_required,
+    )
+
+
+def collect_local_function_signatures(tree: ast.AST) -> Dict[str, FunctionSignature]:
+    signatures: Dict[str, FunctionSignature] = {}
+    for node in getattr(tree, "body", []):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            signatures[node.name] = build_function_signature(node)
+    return signatures
+
+
+def module_path_from_import(repo: Path, current_file: Path, module: Optional[str], level: int) -> Optional[Path]:
+    try:
+        rel_parts = current_file.relative_to(repo).parts
+    except ValueError:
+        return None
+    if level > 0:
+        package_parts = list(rel_parts[:-1])
+        if level > len(package_parts):
+            return None
+        package_parts = package_parts[: len(package_parts) - level + 1]
+        if module:
+            package_parts.extend(module.split("."))
+        candidate = repo.joinpath(*package_parts)
+    else:
+        if not module:
+            return None
+        candidate = repo.joinpath(*module.split("."))
+    py_candidate = candidate.with_suffix(".py")
+    init_candidate = candidate / "__init__.py"
+    if py_candidate.exists():
+        return py_candidate
+    if init_candidate.exists():
+        return init_candidate
+    return None
+
+
+def resolve_imported_local_signatures(repo: Path, rel_path: str, tree: ast.AST) -> Tuple[Dict[str, FunctionSignature], List[Dict[str, Any]], set[str]]:
+    signatures: Dict[str, FunctionSignature] = {}
+    import_issues: List[Dict[str, Any]] = []
+    imported_names: set[str] = set()
+    file_path = repo / rel_path
+    for node in getattr(tree, "body", []):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imported_names.add(alias.asname or alias.name.split(".", 1)[0])
+        elif isinstance(node, ast.ImportFrom):
+            imported_names.update(alias.asname or alias.name for alias in node.names)
+            module_path = module_path_from_import(repo, file_path, node.module, node.level)
+            if not module_path:
+                if node.level > 0:
+                    import_issues.append(
+                        {
+                            "kind": "local_import_unresolved",
+                            "severity": "failed",
+                            "file": rel_path,
+                            "message": f"No se pudo resolver el import local: from {'.' * node.level}{node.module or ''} import ...",
+                        }
+                    )
+                continue
+            source = read_text(module_path)
+            try:
+                imported_tree = ast.parse(source)
+            except SyntaxError as exc:
+                import_issues.append(
+                    {
+                        "kind": "local_import_syntax_error",
+                        "severity": "failed",
+                        "file": rel_path,
+                        "message": f"El módulo importado {module_path.relative_to(repo)} no parsea: {exc}",
+                    }
+                )
+                continue
+            imported_signatures = collect_local_function_signatures(imported_tree)
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                if alias.name in imported_signatures:
+                    signatures[alias.asname or alias.name] = imported_signatures[alias.name]
+    return signatures, import_issues, imported_names
+
+
+def run_optional_semantic_tool(
+    repo: Path,
+    files: List[str],
+    mode: str,
+    timeout: int,
+) -> Dict[str, Any]:
+    tool_cmd: Optional[List[str]] = None
+    tool_name = ""
+    if mode in {"auto", "ruff"} and command_exists("ruff"):
+        tool_name = "ruff"
+        tool_cmd = ["ruff", "check", "--select", "F821,F822,F823", *files]
+    elif mode in {"auto", "pyflakes"} and command_exists("pyflakes"):
+        tool_name = "pyflakes"
+        tool_cmd = ["pyflakes", *files]
+    else:
+        return {"tool": None, "status": "skipped", "issues": [], "message": "No optional semantic tool available."}
+
+    try:
+        rc, out, err = run_cmd(tool_cmd, cwd=repo, capture=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {
+            "tool": tool_name,
+            "status": "warning",
+            "issues": [],
+            "message": f"{tool_name} timed out after {timeout}s.",
+        }
+    output = "\n".join(part for part in [out.strip(), err.strip()] if part).strip()
+    if rc == 0:
+        return {"tool": tool_name, "status": "ok", "issues": [], "message": output}
+    return {
+        "tool": tool_name,
+        "status": "failed",
+        "issues": [{"kind": "optional_tool", "severity": "failed", "message": output or f"{tool_name} reported issues."}],
+        "message": output,
+    }
+
+
+def python_module_name_for_path(rel_path: str) -> Optional[str]:
+    path = Path(rel_path)
+    if path.suffix != ".py":
+        return None
+    parts = list(path.with_suffix("").parts)
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    if not parts:
+        return None
+    return ".".join(parts)
+
+
+def run_python_smoke_imports(
+    repo: Path,
+    changed_files: List[str],
+    runner: Optional[str],
+    timeout: int,
+) -> Dict[str, Any]:
+    if not runner:
+        return {"status": "skipped", "issues": [], "warnings": ["No Python runner available for smoke imports."], "modules": []}
+    modules = [python_module_name_for_path(path) for path in changed_files if path.endswith(".py")]
+    modules = [module for module in modules if module]
+    if not modules:
+        return {"status": "skipped", "issues": [], "warnings": ["No changed Python modules to import."], "modules": []}
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join([str(repo), str(repo / "src"), env.get("PYTHONPATH", "")]).strip(os.pathsep)
+    issues: List[Dict[str, Any]] = []
+    for module in modules:
+        try:
+            rc, out, err = run_cmd([runner, "-c", f"import importlib; importlib.import_module('{module}')"], cwd=repo, capture=True, timeout=timeout, env=env)
+        except subprocess.TimeoutExpired:
+            return {"status": "warning", "issues": [], "warnings": [f"Smoke import timed out after {timeout}s."], "modules": modules}
+        if rc != 0:
+            issues.append(
+                {
+                    "kind": "smoke_import_failed",
+                    "severity": "failed",
+                    "module": module,
+                    "message": truncate((out + "\n" + err).strip(), 2000),
+                }
+            )
+    return {
+        "status": "failed" if issues else "ok",
+        "issues": issues,
+        "warnings": [],
+        "modules": modules,
+    }
+
+
+def run_semantic_validation(
+    repo: Path,
+    changed_files: List[str],
+    *,
+    enabled: bool,
+    mode: str,
+    strict: bool,
+    timeout: int,
+) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {
+        "enabled": enabled,
+        "mode": mode,
+        "strict": strict,
+        "timeout_seconds": timeout,
+        "status": "skipped",
+        "files_checked": [],
+        "issues": [],
+        "warnings": [],
+        "tools": [],
+    }
+    if not enabled:
+        summary["warnings"].append("Semantic validation disabled.")
+        return summary
+
+    python_files = [path for path in changed_files if path.endswith(".py")]
+    summary["files_checked"] = python_files
+    if not python_files:
+        summary["warnings"].append("No changed Python files to validate.")
+        return summary
+
+    for rel_path in python_files:
+        source = read_text(repo / rel_path)
+        try:
+            tree = ast.parse(source)
+        except SyntaxError as exc:
+            summary["issues"].append(
+                {
+                    "kind": "syntax_error",
+                    "severity": "failed",
+                    "file": rel_path,
+                    "message": str(exc),
+                }
+            )
+            continue
+
+        local_sigs = collect_local_function_signatures(tree)
+        imported_sigs, import_issues, imported_names = resolve_imported_local_signatures(repo, rel_path, tree)
+        summary["issues"].extend(import_issues)
+        known_callables = {**local_sigs, **imported_sigs}
+        module_names = set(local_sigs) | imported_names | set(dir(builtins))
+
+        class SemanticVisitor(ast.NodeVisitor):
+            def __init__(self) -> None:
+                self.scopes: List[set[str]] = [set(module_names)]
+
+            def _all_names(self) -> set[str]:
+                combined: set[str] = set()
+                for scope in self.scopes:
+                    combined.update(scope)
+                return combined
+
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                params = {arg.arg for arg in node.args.posonlyargs + node.args.args + node.args.kwonlyargs}
+                if node.args.vararg:
+                    params.add(node.args.vararg.arg)
+                if node.args.kwarg:
+                    params.add(node.args.kwarg.arg)
+                self.scopes.append(params)
+                self.generic_visit(node)
+                self.scopes.pop()
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+            def visit_Assign(self, node: ast.Assign) -> None:
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        self.scopes[-1].add(target.id)
+                self.generic_visit(node)
+
+            def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+                if isinstance(node.target, ast.Name):
+                    self.scopes[-1].add(node.target.id)
+                self.generic_visit(node)
+
+            def visit_Call(self, node: ast.Call) -> None:
+                if isinstance(node.func, ast.Name):
+                    callee = node.func.id
+                    if any(keyword.arg is None for keyword in node.keywords):
+                        return
+                    if callee in known_callables:
+                        sig = known_callables[callee]
+                        provided_positional = len(node.args)
+                        provided_keyword_names = {kw.arg for kw in node.keywords if kw.arg}
+                        missing_required = max(
+                            0,
+                            sig.required_positional - provided_positional - len([name for name in provided_keyword_names if name])
+                        )
+                        if sig.max_positional is not None and provided_positional > sig.max_positional:
+                            summary["issues"].append(
+                                {
+                                    "kind": "call_arity_mismatch",
+                                    "severity": "failed",
+                                    "file": rel_path,
+                                    "message": f"Llamada a {callee} con demasiados argumentos posicionales ({provided_positional}); máximo {sig.max_positional}.",
+                                    "line": node.lineno,
+                                }
+                            )
+                        elif missing_required > 0:
+                            summary["issues"].append(
+                                {
+                                    "kind": "call_arity_mismatch",
+                                    "severity": "failed",
+                                    "file": rel_path,
+                                    "message": f"Llamada a {callee} con argumentos faltantes; requiere {sig.required_positional} posicionales.",
+                                    "line": node.lineno,
+                                }
+                            )
+                    elif callee not in self._all_names():
+                        summary["issues"].append(
+                            {
+                                "kind": "undefined_call_target",
+                                "severity": "failed",
+                                "file": rel_path,
+                                "message": f"Llamada a nombre no definido: {callee}",
+                                "line": node.lineno,
+                            }
+                        )
+                self.generic_visit(node)
+
+        SemanticVisitor().visit(tree)
+
+    dependency_audit = audit_python_dependency_declarations(repo, python_files)
+    if not dependency_audit["ok"]:
+        for issue in dependency_audit["issues"]:
+            summary["issues"].append(
+                {
+                    "kind": "undeclared_dependency",
+                    "severity": "failed",
+                    "file": issue["file"],
+                    "message": f"Imports sin dependencia declarada: {', '.join(issue['missing_dependencies'])}",
+                }
+            )
+
+    optional_tool = run_optional_semantic_tool(repo, python_files, mode, timeout)
+    summary["tools"].append(optional_tool)
+    if optional_tool["status"] == "warning" and optional_tool.get("message"):
+        summary["warnings"].append(optional_tool["message"])
+    summary["issues"].extend(optional_tool.get("issues", []))
+
+    failed_issues = [issue for issue in summary["issues"] if issue.get("severity") == "failed"]
+    if failed_issues:
+        summary["status"] = "failed" if strict else "warning"
+    elif summary["warnings"]:
+        summary["status"] = "warning"
+    else:
+        summary["status"] = "ok"
+    return summary
 
 
 def change_dependency_refs(change: PlanChange) -> List[str]:
@@ -1057,6 +1461,57 @@ def collect_git_changed_files(repo: Path, base_ref: str) -> List[str]:
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
+def infer_validation_changed_files(repo: Path, args) -> Tuple[List[str], str]:
+    base_ref = (getattr(args, "base_ref", "") or "").strip()
+    if not base_ref:
+        try:
+            base_ref = infer_base_ref(repo)
+        except Exception:
+            base_ref = "HEAD~1"
+    changed = collect_git_changed_files(repo, base_ref)
+    if changed:
+        return changed, base_ref
+    code, out, _ = run_cmd(["git", "diff", "--name-only", "HEAD"], cwd=repo, capture=True)
+    if code == 0:
+        fallback = [line.strip() for line in out.splitlines() if line.strip()]
+        if fallback:
+            return fallback, "HEAD"
+    return [], base_ref
+
+
+def validation_plan_to_dict(plan: ValidationPlan) -> Dict[str, Any]:
+    return {
+        "profile": plan.profile,
+        "source": plan.source,
+        "suggested_profile": plan.suggested_profile,
+        "suggestion_reason": plan.suggestion_reason,
+        "promotion_decision": plan.promotion_decision,
+        "promotion_reasons": plan.promotion_reasons,
+        "promotion_blockers": plan.promotion_blockers,
+        "runner": {
+            "python": plan.context.python_runner,
+            "source": plan.context.python_runner_source,
+            "reproducible": plan.context.runner_reproducible,
+            "usable": plan.context.runner_usable,
+        },
+        "test_command": plan.test_command,
+        "lint_command": plan.lint_command,
+        "semantic_validation": {
+            "enabled": plan.semantic_validation,
+            "mode": plan.semantic_validation_mode,
+            "strict": plan.semantic_validation_strict,
+            "timeout_seconds": plan.semantic_validation_timeout,
+        },
+        "smoke_imports": {
+            "enabled": plan.smoke_imports,
+            "strict": plan.smoke_imports_strict,
+            "runner": plan.smoke_import_runner,
+        },
+        "checks": plan.checks,
+        "context": dataclasses.asdict(plan.context),
+    }
+
+
 # -----------------------------
 # Aider preparation / interaction
 # -----------------------------
@@ -1267,6 +1722,17 @@ def detect_validation_commands(repo: Path, args) -> List[str]:
     if commands:
         return commands
 
+    try:
+        validation_plan = resolve_validation_plan(repo, args)
+        if validation_plan.lint_command:
+            commands.append(validation_plan.lint_command)
+        if validation_plan.test_command:
+            commands.append(validation_plan.test_command)
+        if commands:
+            return commands[:4]
+    except Exception:
+        pass
+
     if (repo / "tests").exists() or (repo / "pytest.ini").exists():
         commands.append("pytest -q")
     if (repo / "pyproject.toml").exists() or (repo / "requirements.txt").exists():
@@ -1284,6 +1750,192 @@ def detect_validation_commands(repo: Path, args) -> List[str]:
     if (repo / "go.mod").exists():
         commands.append("go test ./...")
     return commands[:4]
+
+
+def repo_python_runner(repo: Path) -> Tuple[Optional[str], str]:
+    candidates = [
+        (repo / ".venv" / "bin" / "python", ".venv"),
+        (repo / ".venv" / "Scripts" / "python.exe", ".venv"),
+    ]
+    for path, source in candidates:
+        if path.exists():
+            return str(path), source
+    if command_exists("python3"):
+        return "python3", "system"
+    if command_exists("python"):
+        return "python", "system"
+    return None, "missing"
+
+
+def python_module_available(runner: Optional[str], module: str, repo: Path, timeout: int = 10) -> bool:
+    if not runner:
+        return False
+    try:
+        rc, _, _ = run_cmd([runner, "-c", f"import {module}"], cwd=repo, capture=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False
+    return rc == 0
+
+
+def runner_executes_python(runner: Optional[str], repo: Path, timeout: int = 10) -> bool:
+    if not runner:
+        return False
+    try:
+        rc, _, _ = run_cmd([runner, "-c", "print('ok')"], cwd=repo, capture=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False
+    return rc == 0
+
+
+def detect_validation_context(repo: Path) -> ValidationContext:
+    has_pyproject = (repo / "pyproject.toml").exists()
+    has_requirements = (repo / "requirements.txt").exists()
+    has_setup_cfg = (repo / "setup.cfg").exists()
+    has_src_dir = (repo / "src").exists()
+    has_main_py = (repo / "main.py").exists()
+    has_tests = (repo / "tests").exists() or (repo / "pytest.ini").exists()
+    has_dot_venv = (repo / ".venv").exists()
+    has_uv_lock = (repo / "uv.lock").exists()
+    is_python_repo = any([has_pyproject, has_requirements, has_setup_cfg, has_src_dir, has_main_py])
+    runner, runner_source = repo_python_runner(repo)
+    runner_reproducible = runner_source == ".venv"
+    runner_usable = runner_executes_python(runner, repo) if runner else False
+    pytest_available = python_module_available(runner, "pytest", repo) if runner else False
+    repo_notes: List[str] = []
+    if has_dot_venv:
+        repo_notes.append("Detected .venv in target repo.")
+    if has_uv_lock:
+        repo_notes.append("Detected uv.lock in target repo.")
+        repo_notes.append("uv.lock is only supporting evidence; it is not used as an execution runner by itself.")
+    if not has_dot_venv:
+        repo_notes.append("No repo-local virtual environment detected.")
+    if runner and not runner_usable:
+        repo_notes.append("Detected Python runner did not execute successfully.")
+    if has_tests and not pytest_available:
+        repo_notes.append("Tests exist but pytest is not available in the detected Python runner.")
+    compile_target = []
+    if has_src_dir:
+        compile_target.append("src")
+    if has_main_py:
+        compile_target.append("main.py")
+    compile_command = f"{runner} -m compileall {' '.join(compile_target)}".strip() if runner and compile_target else ""
+    pytest_command = ""
+    if has_tests and pytest_available and runner:
+        pytest_command = f"{runner} -m pytest -q"
+    promotion_reasons: List[str] = []
+    promotion_blockers: List[str] = []
+    if is_python_repo:
+        if runner_reproducible:
+            promotion_reasons.append("Repo-local Python runner detected in .venv.")
+        else:
+            promotion_blockers.append("No reproducible repo-local Python runner was found.")
+        if runner_usable:
+            promotion_reasons.append("The selected Python runner executes successfully.")
+        else:
+            promotion_blockers.append("The selected Python runner is not executable.")
+        if compile_command:
+            promotion_reasons.append("The runner can execute a repo-scoped compile command.")
+        else:
+            promotion_blockers.append("No repo-scoped Python validation command could be derived.")
+        if has_tests:
+            if pytest_command:
+                promotion_reasons.append("pytest is available inside the selected runner.")
+            else:
+                repo_notes.append("pytest-based repo validation is not available; promotion may still use smoke imports only.")
+        else:
+            repo_notes.append("Repo has no test suite; python_repo, if promoted, will rely on smoke imports.")
+    if is_python_repo and runner_reproducible and runner_usable and compile_command:
+        suggested_profile = "python_repo"
+        suggestion_reason = "Python repo with a reproducible local runner and repo-scoped validation commands."
+    elif is_python_repo:
+        suggested_profile = "python_local"
+        suggestion_reason = "Python repo without enough reproducible environment evidence; favor localized checks."
+    else:
+        suggested_profile = "minimal"
+        suggestion_reason = "No clear Python repo structure detected."
+    return ValidationContext(
+        is_python_repo=is_python_repo,
+        has_tests=has_tests,
+        has_pyproject=has_pyproject,
+        has_requirements=has_requirements,
+        has_setup_cfg=has_setup_cfg,
+        has_src_dir=has_src_dir,
+        has_main_py=has_main_py,
+        has_dot_venv=has_dot_venv,
+        has_uv_lock=has_uv_lock,
+        python_runner=runner,
+        python_runner_source=runner_source,
+        runner_reproducible=runner_reproducible,
+        runner_usable=runner_usable,
+        pytest_available=pytest_available,
+        pytest_command=pytest_command,
+        compile_command=compile_command,
+        repo_notes=repo_notes,
+        suggested_profile=suggested_profile,
+        suggestion_reason=suggestion_reason,
+        promotion_reasons=promotion_reasons,
+        promotion_blockers=promotion_blockers,
+    )
+
+
+def resolve_validation_plan(repo: Path, args) -> ValidationPlan:
+    context = detect_validation_context(repo)
+    requested = (getattr(args, "validation_profile", "") or "auto").strip().lower()
+    if requested not in {"auto", "minimal", "python_local", "python_repo", "strict"}:
+        raise SystemExit(f"validation_profile inválido: {requested}.")
+    if requested == "auto":
+        profile = context.suggested_profile
+        source = "auto"
+    else:
+        profile = requested
+        source = "explicit"
+    promotion_decision = "promoted" if profile == "python_repo" and context.suggested_profile == "python_repo" else "not_promoted"
+    if requested == "strict" and context.suggested_profile == "python_repo":
+        promotion_decision = "promoted"
+    if requested in {"python_repo", "strict"} and context.suggested_profile != "python_repo":
+        promotion_decision = "forced"
+
+    explicit_test_cmd = str(getattr(args, "test_cmd", "") or "").strip()
+    explicit_lint_cmd = str(getattr(args, "lint_cmd", "") or "").strip() or None
+    test_command = explicit_test_cmd
+    if not test_command:
+        if profile in {"python_repo", "strict"} and context.pytest_command:
+            test_command = context.pytest_command
+        elif profile in {"python_local", "python_repo", "strict"} and context.compile_command:
+            test_command = context.compile_command
+
+    semantic_enabled = bool(getattr(args, "semantic_validation", False)) or profile in {"python_local", "python_repo", "strict"}
+    semantic_mode = getattr(args, "semantic_validation_mode", "auto") or "auto"
+    semantic_strict = bool(getattr(args, "semantic_validation_strict", False)) or profile in {"python_local", "python_repo", "strict"}
+    semantic_timeout = int(getattr(args, "semantic_validation_timeout", 60) or 60)
+    smoke_imports = profile in {"python_repo", "strict"} and context.runner_reproducible and context.runner_usable and bool(context.python_runner)
+    smoke_imports_strict = profile == "strict"
+    checks = [
+        {"name": "test_command", "level": 1, "blocking": True, "status": "pending", "planned": bool(test_command)},
+        {"name": "semantic_ast", "level": 2, "blocking": semantic_strict, "status": "pending" if semantic_enabled else "skipped", "planned": semantic_enabled},
+        {"name": "optional_python_tool", "level": 3, "blocking": profile == "strict", "status": "pending" if semantic_enabled else "skipped", "planned": semantic_enabled},
+        {"name": "smoke_imports", "level": 4, "blocking": smoke_imports_strict, "status": "pending" if smoke_imports else "skipped", "planned": smoke_imports},
+    ]
+    return ValidationPlan(
+        profile=profile,
+        source=source,
+        suggested_profile=context.suggested_profile,
+        suggestion_reason=context.suggestion_reason,
+        promotion_decision=promotion_decision,
+        promotion_reasons=context.promotion_reasons,
+        promotion_blockers=context.promotion_blockers,
+        test_command=test_command,
+        lint_command=explicit_lint_cmd,
+        semantic_validation=semantic_enabled,
+        semantic_validation_mode=semantic_mode,
+        semantic_validation_strict=semantic_strict,
+        semantic_validation_timeout=semantic_timeout,
+        smoke_imports=smoke_imports,
+        smoke_imports_strict=smoke_imports_strict,
+        smoke_import_runner=context.python_runner if smoke_imports else None,
+        checks=checks,
+        context=context,
+    )
 
 
 def build_reasoner_prompt(
@@ -1548,12 +2200,35 @@ def build_grounded_final_report(
     selected_titles = apply_details.get("selected_change_titles") or []
     selected_lines = [f"- {title}" for title in selected_titles] or ["- No selected change titles recorded."]
     test_summary_line = "- No test report was produced."
+    semantic_summary_line = "- No semantic validation evidence."
+    validation_profile_line = "- Validation profile not recorded."
+    checks_line = "- Validation checks not recorded."
+    promotion_line = "- Promotion decision not recorded."
+    runner_line = "- Runner not recorded."
+    semantic_alert = False
     if test_report_md.strip():
         match = re.search(r"- stage_status: \*\*(.+?)\*\*", test_report_md)
+        semantic_match = re.search(r"- semantic_validation_status: \*\*(.+?)\*\*", test_report_md)
+        profile_match = re.search(r"- validation_profile: \*\*(.+?)\*\*", test_report_md)
+        promotion_match = re.search(r"- promotion_decision: \*\*(.+?)\*\*", test_report_md)
+        runner_match = re.search(r"- runner: \*\*(.+?)\*\*", test_report_md)
         if match:
             test_summary_line = f"- Test report status: **{match.group(1)}**."
         else:
             test_summary_line = "- Test report exists in AI/test-report.md."
+        if semantic_match:
+            semantic_status = semantic_match.group(1)
+            semantic_summary_line = f"- Semantic validation status: **{semantic_status}**."
+            semantic_alert = semantic_status in {"warning", "failed"}
+        if profile_match:
+            validation_profile_line = f"- Validation profile used: **{profile_match.group(1)}**."
+        if promotion_match:
+            promotion_line = f"- Promotion decision: **{promotion_match.group(1)}**."
+        if runner_match:
+            runner_line = f"- Validation runner: **{runner_match.group(1)}**."
+        checks = re.findall(r"- L(\d+) `([^`]+)`: \*\*(.+?)\*\* blocking=(True|False)", test_report_md)
+        if checks:
+            checks_line = "- Validation checks: " + "; ".join(f"L{level} {name}={status}" for level, name, status, _ in checks[:6]) + "."
     diff_excerpt = truncate(git_diff.strip(), 4000) if git_diff.strip() else "[No git diff recorded]"
     return "\n".join(
         [
@@ -1575,11 +2250,17 @@ def build_grounded_final_report(
             "",
             "## Test Results Interpretation",
             test_summary_line,
+            semantic_summary_line,
+            validation_profile_line,
+            promotion_line,
+            runner_line,
+            checks_line,
             "- Current validation only proves the repo still compiles under `python3 -m compileall src main.py`.",
             "",
             "## Risks and Regressions",
             "- This report is grounded on metadata and git diff to avoid hallucinated success claims.",
             "- A green compile check is weaker than behavioral tests; functional regressions may still exist.",
+            "- Semantic validation reported suspicious Python issues." if semantic_alert else "- No semantic validation alerts were recorded.",
             "- Review the actual diff before treating the change as complete.",
             "",
             "## Next Steps",
@@ -1738,15 +2419,15 @@ def preflight(args, repo: Path) -> None:
             raise SystemExit(f"No existe el archivo de goals: {goals_path}")
 
     if args.cmd in {"test", "run"}:
-        require_nonempty(args.test_cmd, "test_cmd", "Config: test_cmd: 'pytest -q'")
-        # Validación ligera: si no es shell, comprobar que exista el ejecutable
-        if not looks_like_shell_command(args.test_cmd):
-            first = shlex.split(args.test_cmd)[0]
+        validation_plan = resolve_validation_plan(repo, args)
+        require_nonempty(validation_plan.test_command, "validation test command", "Config: validation_profile/test_cmd")
+        if not looks_like_shell_command(validation_plan.test_command):
+            first = shlex.split(validation_plan.test_command)[0]
             if not command_exists(first):
                 raise SystemExit(f"No se encontró el ejecutable del test_cmd: {first}")
 
-        if args.lint_cmd.strip() and not looks_like_shell_command(args.lint_cmd):
-            first = shlex.split(args.lint_cmd)[0]
+        if validation_plan.lint_command and not looks_like_shell_command(validation_plan.lint_command):
+            first = shlex.split(validation_plan.lint_command)[0]
             if not command_exists(first):
                 raise SystemExit(f"No se encontró el ejecutable del lint_cmd: {first}")
 
@@ -1770,6 +2451,12 @@ def write_test_report(
     test_cmd: str,
     lint_required: bool = False,
     timeout: int = 1800,
+    changed_files: Optional[List[str]] = None,
+    semantic_validation: bool = False,
+    semantic_validation_mode: str = "auto",
+    semantic_validation_strict: bool = False,
+    semantic_validation_timeout: int = 60,
+    validation_plan: Optional[ValidationPlan] = None,
 ) -> Tuple[bool, str, Dict[str, Any]]:
     """
     Run lint and tests. Save a Markdown report and JSON summary.
@@ -1777,12 +2464,48 @@ def write_test_report(
     """
     entries = []
     summary = {
+        "validation_profile": None,
         "lint": None,
         "tests": None,
         "lint_required": lint_required,
         "passed": False,
         "timestamp": now_stamp(),
+        "semantic_validation": {
+            "enabled": semantic_validation,
+            "status": "skipped",
+            "issues": [],
+            "warnings": [],
+            "files_checked": [],
+            "tools": [],
+        },
+        "checks": [],
     }
+    if validation_plan is None:
+        validation_context = detect_validation_context(repo)
+        validation_plan = ValidationPlan(
+            profile="manual",
+            source="manual",
+            suggested_profile=validation_context.suggested_profile,
+            suggestion_reason=validation_context.suggestion_reason,
+            promotion_decision="manual",
+            promotion_reasons=validation_context.promotion_reasons,
+            promotion_blockers=validation_context.promotion_blockers,
+            test_command=test_cmd,
+            lint_command=lint_cmd,
+            semantic_validation=semantic_validation,
+            semantic_validation_mode=semantic_validation_mode,
+            semantic_validation_strict=semantic_validation_strict,
+            semantic_validation_timeout=semantic_validation_timeout,
+            smoke_imports=False,
+            smoke_imports_strict=False,
+            smoke_import_runner=None,
+            checks=[],
+            context=validation_context,
+        )
+    safe_write(ai_dir / "validation-execution-plan.json", json.dumps(validation_plan_to_dict(validation_plan), indent=2, ensure_ascii=False))
+    lint_cmd = validation_plan.lint_command
+    test_cmd = validation_plan.test_command
+    summary["validation_profile"] = validation_plan_to_dict(validation_plan)
 
     def run_and_capture(label: str, cmd: str) -> dict:
         use_shell = looks_like_shell_command(cmd)
@@ -1821,6 +2544,7 @@ def write_test_report(
             "timeout_seconds": lint_res["timeout_seconds"],
         }
         entries.append(lint_res)
+        summary["checks"].append({"name": "lint", "level": 1, "status": lint_res["status"], "blocking": lint_required})
 
     test_res = run_and_capture("tests", test_cmd)
     test_ok = test_res["returncode"] == 0
@@ -1830,18 +2554,78 @@ def write_test_report(
         "timeout_seconds": test_res["timeout_seconds"],
     }
     entries.append(test_res)
+    summary["checks"].append({"name": "test_command", "level": 1, "status": test_res["status"], "blocking": True, "command": test_cmd})
 
     passed = test_ok and (lint_ok or not lint_required)
     summary["passed"] = passed
+    semantic_summary = run_semantic_validation(
+        repo,
+        changed_files or [],
+        enabled=validation_plan.semantic_validation,
+        mode=validation_plan.semantic_validation_mode,
+        strict=validation_plan.semantic_validation_strict,
+        timeout=validation_plan.semantic_validation_timeout,
+    )
+    summary["semantic_validation"] = semantic_summary
+    summary["checks"].append(
+        {
+            "name": "semantic_ast",
+            "level": 2,
+            "status": semantic_summary["status"],
+            "blocking": validation_plan.semantic_validation_strict,
+        }
+    )
+    tool_status = semantic_summary["tools"][0]["status"] if semantic_summary["tools"] else "skipped"
+    summary["checks"].append(
+        {
+            "name": "optional_python_tool",
+            "level": 3,
+            "status": tool_status,
+            "blocking": validation_plan.profile == "strict",
+        }
+    )
+    smoke_summary = run_python_smoke_imports(
+        repo,
+        changed_files or [],
+        validation_plan.smoke_import_runner,
+        validation_plan.semantic_validation_timeout,
+    ) if validation_plan.smoke_imports else {"status": "skipped", "issues": [], "warnings": ["Smoke imports omitted."], "modules": []}
+    summary["smoke_imports"] = smoke_summary
+    summary["checks"].append(
+        {
+            "name": "smoke_imports",
+            "level": 4,
+            "status": smoke_summary["status"],
+            "blocking": validation_plan.smoke_imports_strict,
+        }
+    )
     if any(e["status"] == "timeout" for e in entries):
         summary["status"] = "timeout"
+    elif semantic_summary["status"] == "failed":
+        summary["status"] = "failed"
+        summary["passed"] = False
+    elif smoke_summary["status"] == "failed":
+        summary["status"] = "failed" if validation_plan.smoke_imports_strict else "warning"
+        if validation_plan.smoke_imports_strict:
+            summary["passed"] = False
+    elif semantic_summary["status"] == "warning":
+        summary["status"] = "warning" if passed else "failed"
+    elif smoke_summary["status"] == "warning":
+        summary["status"] = "warning" if passed else "failed"
     else:
         summary["status"] = "ok" if passed else "failed"
+    passed = summary["passed"]
 
     md_parts = [f"# Test Report\n\nTimestamp: {summary['timestamp']}\n"]
     md_parts.append(f"- lint_required: **{lint_required}**\n")
-    md_parts.append(f"- overall_passed: **{passed}**\n")
+    md_parts.append(f"- overall_passed: **{summary['passed']}**\n")
     md_parts.append(f"- stage_status: **{summary['status']}**\n")
+    md_parts.append(f"- semantic_validation_status: **{semantic_summary['status']}**\n")
+    md_parts.append(f"- validation_profile: **{validation_plan.profile}** ({validation_plan.source})\n")
+    md_parts.append(f"- suggested_profile: **{validation_plan.suggested_profile}**\n")
+    md_parts.append(f"- profile_reason: {validation_plan.suggestion_reason}\n")
+    md_parts.append(f"- promotion_decision: **{validation_plan.promotion_decision}**\n")
+    md_parts.append(f"- runner: **{validation_plan.context.python_runner or 'none'}** ({validation_plan.context.python_runner_source})\n")
 
     for e in entries:
         md_parts.append(f"\n## {e['label'].title()}\n")
@@ -1853,6 +2637,63 @@ def write_test_report(
             md_parts.append(f"Timeout seconds: **{e['timeout_seconds']}**\n")
         md_parts.append("STDOUT:\n```text\n" + truncate(e["stdout"], 15000) + "\n```\n")
         md_parts.append("STDERR:\n```text\n" + truncate(e["stderr"], 15000) + "\n```\n")
+
+    md_parts.append("\n## Semantic Validation\n")
+    md_parts.append(f"- enabled: **{semantic_summary['enabled']}**\n")
+    md_parts.append(f"- status: **{semantic_summary['status']}**\n")
+    if semantic_summary["files_checked"]:
+        md_parts.append("- files_checked:\n")
+        md_parts.extend(f"  - `{path}`\n" for path in semantic_summary["files_checked"])
+    if semantic_summary["issues"]:
+        md_parts.append("- issues:\n")
+        for issue in semantic_summary["issues"]:
+            location = f" ({issue['file']}:{issue.get('line')})" if issue.get("file") else ""
+            md_parts.append(f"  - [{issue['kind']}] {issue['message']}{location}\n")
+    if semantic_summary["warnings"]:
+        md_parts.append("- warnings:\n")
+        for warning in semantic_summary["warnings"]:
+            md_parts.append(f"  - {warning}\n")
+    if semantic_summary["tools"]:
+        md_parts.append("- tools:\n")
+        for tool in semantic_summary["tools"]:
+            name = tool.get("tool") or "none"
+            md_parts.append(f"  - `{name}`: {tool.get('status', 'unknown')}\n")
+
+    md_parts.append("\n## Smoke Imports\n")
+    md_parts.append(f"- status: **{smoke_summary['status']}**\n")
+    if smoke_summary.get("modules"):
+        md_parts.append("- modules:\n")
+        for module in smoke_summary["modules"]:
+            md_parts.append(f"  - `{module}`\n")
+    if smoke_summary.get("issues"):
+        md_parts.append("- issues:\n")
+        for issue in smoke_summary["issues"]:
+            md_parts.append(f"  - [{issue['kind']}] {issue['module']}: {issue['message']}\n")
+    if smoke_summary.get("warnings"):
+        md_parts.append("- warnings:\n")
+        for warning in smoke_summary["warnings"]:
+            md_parts.append(f"  - {warning}\n")
+
+    md_parts.append("\n## Validation Checks\n")
+    for check in summary["checks"]:
+        md_parts.append(
+            f"- L{check['level']} `{check['name']}`: **{check['status']}**"
+            f" blocking={check['blocking']}\n"
+        )
+
+    md_parts.append("\n## Validation Plan\n")
+    if validation_plan.promotion_reasons:
+        md_parts.append("- promotion_reasons:\n")
+        for reason in validation_plan.promotion_reasons:
+            md_parts.append(f"  - {reason}\n")
+    if validation_plan.promotion_blockers:
+        md_parts.append("- promotion_blockers:\n")
+        for blocker in validation_plan.promotion_blockers:
+            md_parts.append(f"  - {blocker}\n")
+    if validation_plan.context.repo_notes:
+        md_parts.append("- repo_notes:\n")
+        for note in validation_plan.context.repo_notes:
+            md_parts.append(f"  - {note}\n")
 
     report_md = "\n".join(md_parts)
     safe_write(ai_dir / "test-report.md", report_md)
@@ -2059,21 +2900,31 @@ def cmd_test(args) -> None:
     repo, ai_dir, recorder = init_run_context(args)
     preflight(args, repo)
 
-    lint_cmd = args.lint_cmd.strip() or None
+    validation_plan = resolve_validation_plan(repo, args)
+    changed_files, changed_base_ref = infer_validation_changed_files(repo, args)
     try:
         with record_stage(recorder, "test") as details:
             clear_artifacts(ai_dir, ["test-report.md", "test-report.json", "test-error.md"])
             passed, _, summary = write_test_report(
                 repo,
                 ai_dir,
-                lint_cmd,
-                args.test_cmd,
+                validation_plan.lint_command,
+                validation_plan.test_command,
                 lint_required=args.lint_required,
                 timeout=args.test_timeout,
+                changed_files=changed_files,
+                semantic_validation=validation_plan.semantic_validation,
+                semantic_validation_mode=validation_plan.semantic_validation_mode,
+                semantic_validation_strict=validation_plan.semantic_validation_strict,
+                semantic_validation_timeout=validation_plan.semantic_validation_timeout,
+                validation_plan=validation_plan,
             )
             details["__status"] = summary["status"]
             details["artifact"] = str(ai_dir / "test-report.md")
             details["test_timeout"] = args.test_timeout
+            details["changed_files_base_ref"] = changed_base_ref
+            details["changed_files"] = changed_files
+            details["validation_profile"] = summary["validation_profile"]
             details["summary"] = summary
             print(f"test: passed={passed} (report in {ai_dir / 'test-report.md'})")
     except BaseException as exc:
@@ -2081,7 +2932,7 @@ def cmd_test(args) -> None:
         recorder.fail_run(str(exc), "timeout" if isinstance(exc, ExecutionFailure) and exc.status == "timeout" else "failed", {"stage": "test", "error_path": str(error_path)})
         print(f"test: failed. See {error_path}")
         raise
-    recorder.complete_run(summary["status"], {"passed": passed, "test_report": str(ai_dir / "test-report.md")})
+    recorder.complete_run(summary["status"], {"passed": passed, "test_report": str(ai_dir / "test-report.md"), "validation_profile": validation_plan.profile})
     if not passed:
         raise SystemExit(124 if summary["status"] == "timeout" else 2)
 
@@ -2168,8 +3019,9 @@ def cmd_run(args) -> None:
             details.update(plan_meta)
             print(f"run: plan -> {ai_dir / 'plan.md'}")
 
-        lint_cmd = args.lint_cmd.strip() or None
-        test_cmd = args.test_cmd
+        validation_plan = resolve_validation_plan(repo, args)
+        lint_cmd = validation_plan.lint_command
+        test_cmd = validation_plan.test_command
         last_feedback = ""
         final_passed = False
         test_summary: Dict[str, Any] = {"status": "failed"}
@@ -2291,11 +3143,18 @@ def cmd_run(args) -> None:
                         test_cmd,
                         lint_required=args.lint_required,
                         timeout=args.test_timeout,
+                        changed_files=changed_files,
+                        semantic_validation=validation_plan.semantic_validation,
+                        semantic_validation_mode=validation_plan.semantic_validation_mode,
+                        semantic_validation_strict=validation_plan.semantic_validation_strict,
+                        semantic_validation_timeout=validation_plan.semantic_validation_timeout,
+                        validation_plan=validation_plan,
                     )
                     test_details["__status"] = test_summary["status"]
                     test_details["artifact"] = str(ai_dir / "test-report.md")
                     test_details["iteration"] = i
                     test_details["test_timeout"] = args.test_timeout
+                    test_details["validation_profile"] = test_summary.get("validation_profile")
                     test_details["summary"] = test_summary
                     print(f"run: iter {i} tests passed={passed}")
                 if passed:
@@ -2357,8 +3216,8 @@ def cmd_run(args) -> None:
         print(f"run: failed during {failed_stage}. See {error_path}")
         raise
 
-    final_status = "ok" if final_passed else test_summary.get("status", "failed")
-    recorder.complete_run(final_status, {"tests_passed": final_passed, "test_status": test_summary.get("status", "failed")})
+    final_status = test_summary.get("status", "ok") if final_passed else test_summary.get("status", "failed")
+    recorder.complete_run(final_status, {"tests_passed": final_passed, "test_status": test_summary.get("status", "failed"), "validation_profile": validation_plan.profile})
 
 
 # -----------------------------
@@ -2391,6 +3250,11 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--apply-limit-to-plan-files", action="store_true", help="Limita Aider a los archivos explícitamente listados en el plan o en --allowed-file.")
         sp.add_argument("--apply-enforce-plan-scope", action="store_true", help="Falla si Aider modifica archivos fuera del scope seleccionado.")
         sp.add_argument("--apply-skip-unsupported-plan-changes", action="store_true", help="Omite cambios del plan que parecen requerir archivos o dependencias no presentes en el repo.")
+        sp.add_argument("--validation-profile", default="auto", help="Perfil de validación: auto, minimal, python_local, python_repo o strict.")
+        sp.add_argument("--semantic-validation", action="store_true", help="Activa validación semántica localizada sobre archivos Python cambiados.")
+        sp.add_argument("--semantic-validation-mode", default="auto", help="Modo de validación semántica: auto, ast, ruff o pyflakes.")
+        sp.add_argument("--semantic-validation-strict", action="store_true", help="Si se activa, los hallazgos semánticos fallan la corrida.")
+        sp.add_argument("--semantic-validation-timeout", type=int, default=60, help="Timeout para herramientas opcionales de validación semántica.")
         sp.add_argument("--aider-model", default="", help="Modelo para Aider. Ej: ollama:qwen3-coder:14b")
         sp.add_argument("--reasoner-timeout", type=int, default=1800, help="Timeout en segundos para el reasoner del plan.")
         sp.add_argument("--report-timeout", type=int, default=0, help="Timeout en segundos para el reporte final. Si es 0, usa reasoner-timeout.")

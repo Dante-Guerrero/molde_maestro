@@ -125,6 +125,11 @@ class MergeConfigTests(unittest.TestCase):
             "apply_limit_to_plan_files": True,
             "apply_enforce_plan_scope": True,
             "apply_skip_unsupported_plan_changes": True,
+            "validation_profile": "python_local",
+            "semantic_validation": True,
+            "semantic_validation_mode": "ast",
+            "semantic_validation_strict": True,
+            "semantic_validation_timeout": 12,
         }
         merged = pipeline.merge_config_into_args(args, cfg)
         self.assertEqual(merged.reasoner_timeout, 11)
@@ -139,6 +144,11 @@ class MergeConfigTests(unittest.TestCase):
         self.assertTrue(merged.apply_limit_to_plan_files)
         self.assertTrue(merged.apply_enforce_plan_scope)
         self.assertTrue(merged.apply_skip_unsupported_plan_changes)
+        self.assertEqual(merged.validation_profile, "python_local")
+        self.assertTrue(merged.semantic_validation)
+        self.assertEqual(merged.semantic_validation_mode, "ast")
+        self.assertTrue(merged.semantic_validation_strict)
+        self.assertEqual(merged.semantic_validation_timeout, 12)
 
 
 class PlanStrategyTests(unittest.TestCase):
@@ -160,6 +170,7 @@ class PlanStrategyTests(unittest.TestCase):
             apply_limit_to_plan_files=True,
             apply_enforce_plan_scope=True,
             apply_skip_unsupported_plan_changes=False,
+            validation_profile="auto",
         )
         for key, value in overrides.items():
             setattr(base, key, value)
@@ -304,6 +315,115 @@ class ApplyScopeTests(unittest.TestCase):
         self.assertIn("Do not edit files outside this allowlist", instruction)
         self.assertIn("src/foo.py", instruction)
         self.assertIn("fast mode", instruction)
+
+
+class ValidationProfileTests(unittest.TestCase):
+    def make_args(self, **overrides) -> argparse.Namespace:
+        base = argparse.Namespace(
+            test_cmd="",
+            lint_cmd="",
+            validation_profile="auto",
+            semantic_validation=False,
+            semantic_validation_mode="auto",
+            semantic_validation_strict=False,
+            semantic_validation_timeout=60,
+        )
+        for key, value in overrides.items():
+            setattr(base, key, value)
+        return base
+
+    def test_detect_validation_context_suggests_python_local_without_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            (repo / "requirements.txt").write_text("pydantic>=2\n", encoding="utf-8")
+            (repo / "src/pkg").mkdir(parents=True)
+            context = pipeline.detect_validation_context(repo)
+        self.assertEqual(context.suggested_profile, "python_local")
+        self.assertIn("without enough reproducible environment evidence", context.suggestion_reason)
+
+    def test_resolve_validation_plan_prefers_pytest_when_repo_supports_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            (repo / "tests").mkdir()
+            (repo / "src/pkg").mkdir(parents=True)
+            (repo / ".venv/bin").mkdir(parents=True)
+            venv_python = repo / ".venv/bin/python"
+            venv_python.write_text("", encoding="utf-8")
+            with mock.patch("molde_maestro.pipeline.runner_executes_python", return_value=True):
+                with mock.patch("molde_maestro.pipeline.python_module_available", return_value=True):
+                    plan = pipeline.resolve_validation_plan(repo, self.make_args())
+        self.assertEqual(plan.profile, "python_repo")
+        self.assertIn("-m pytest -q", plan.test_command)
+        self.assertTrue(plan.smoke_imports)
+        self.assertEqual(plan.promotion_decision, "promoted")
+
+    def test_resolve_validation_plan_uses_compile_when_pytest_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            (repo / "requirements.txt").write_text("pydantic>=2\n", encoding="utf-8")
+            (repo / "src/pkg").mkdir(parents=True)
+            with mock.patch("molde_maestro.pipeline.command_exists", side_effect=lambda name: name == "python3"):
+                plan = pipeline.resolve_validation_plan(repo, self.make_args())
+        self.assertEqual(plan.profile, "python_local")
+        self.assertIn("compileall", plan.test_command)
+        self.assertFalse(plan.smoke_imports)
+        self.assertIn("No reproducible repo-local Python runner", " ".join(plan.promotion_blockers))
+
+    def test_infer_validation_changed_files_uses_base_ref_diff(self) -> None:
+        args = argparse.Namespace(base_ref="")
+        with mock.patch("molde_maestro.pipeline.infer_base_ref", return_value="HEAD~1"):
+            with mock.patch("molde_maestro.pipeline.collect_git_changed_files", return_value=["src/pkg/mod.py"]):
+                changed, base_ref = pipeline.infer_validation_changed_files(Path("/tmp/repo"), args)
+        self.assertEqual(base_ref, "HEAD~1")
+        self.assertEqual(changed, ["src/pkg/mod.py"])
+
+    def test_validation_plan_to_dict_exposes_runner_and_promotion(self) -> None:
+        context = pipeline.ValidationContext(
+            is_python_repo=True,
+            has_tests=False,
+            has_pyproject=False,
+            has_requirements=True,
+            has_src_dir=True,
+            has_main_py=True,
+            has_dot_venv=False,
+            has_uv_lock=False,
+            has_setup_cfg=False,
+            python_runner="python3",
+            python_runner_source="system",
+            runner_reproducible=False,
+            runner_usable=True,
+            pytest_available=False,
+            pytest_command="",
+            compile_command="python3 -m compileall src main.py",
+            repo_notes=["No repo-local virtual environment detected."],
+            suggested_profile="python_local",
+            suggestion_reason="reason",
+            promotion_reasons=["runner works"],
+            promotion_blockers=["no .venv"],
+        )
+        plan = pipeline.ValidationPlan(
+            profile="python_local",
+            source="auto",
+            suggested_profile="python_local",
+            suggestion_reason="reason",
+            promotion_decision="not_promoted",
+            promotion_reasons=["runner works"],
+            promotion_blockers=["no .venv"],
+            test_command="python3 -m compileall src main.py",
+            lint_command=None,
+            semantic_validation=True,
+            semantic_validation_mode="ast",
+            semantic_validation_strict=True,
+            semantic_validation_timeout=60,
+            smoke_imports=False,
+            smoke_imports_strict=False,
+            smoke_import_runner=None,
+            checks=[],
+            context=context,
+        )
+        data = pipeline.validation_plan_to_dict(plan)
+        self.assertEqual(data["promotion_decision"], "not_promoted")
+        self.assertEqual(data["runner"]["python"], "python3")
 
 
 class RunRecorderTests(unittest.TestCase):
@@ -505,11 +625,44 @@ class TestReportTests(unittest.TestCase):
                     test_cmd="python3 slow.py",
                     lint_required=False,
                     timeout=3,
+                    changed_files=[],
+                    semantic_validation=False,
                 )
             self.assertFalse(passed)
             self.assertEqual(summary["status"], "timeout")
             report = (ai_dir / "test-report.md").read_text(encoding="utf-8")
             self.assertIn("Timeout seconds", report)
+
+    def test_write_test_report_fails_on_semantic_validation_issue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            ai_dir = repo / "AI"
+            ai_dir.mkdir()
+            (repo / "src/pkg").mkdir(parents=True)
+            (repo / "src/pkg/mod.py").write_text(
+                "def crop_region(image, region):\n    return image\n\n\ndef preprocess_page(image):\n    return crop_region(image)\n",
+                encoding="utf-8",
+            )
+            with mock.patch("molde_maestro.pipeline.run_cmd", return_value=(0, "ok", "")):
+                passed, report_md, summary = pipeline.write_test_report(
+                    repo=repo,
+                    ai_dir=ai_dir,
+                    lint_cmd=None,
+                    test_cmd="python3 -m compileall src",
+                    lint_required=False,
+                    timeout=3,
+                    changed_files=["src/pkg/mod.py"],
+                    semantic_validation=True,
+                    semantic_validation_mode="ast",
+                    semantic_validation_strict=True,
+                    semantic_validation_timeout=5,
+                )
+            self.assertFalse(passed)
+            self.assertEqual(summary["status"], "failed")
+            self.assertEqual(summary["semantic_validation"]["status"], "failed")
+            self.assertEqual(summary["checks"][0]["name"], "test_command")
+            self.assertEqual(summary["validation_profile"]["profile"], "manual")
+            self.assertIn("call_arity_mismatch", report_md)
 
     def test_aider_output_has_fatal_error_detects_provider_issue(self) -> None:
         self.assertTrue(

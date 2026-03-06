@@ -20,6 +20,11 @@ apply_max_plan_changes: 1
 apply_limit_to_plan_files: true
 apply_enforce_plan_scope: true
 apply_skip_unsupported_plan_changes: true
+validation_profile: auto
+semantic_validation: true
+semantic_validation_mode: auto
+semantic_validation_strict: true
+semantic_validation_timeout: 60
 
 test_cmd: "python3 -m compileall src main.py"
 lint_cmd: ""
