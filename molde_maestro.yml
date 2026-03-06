@@ -1,15 +1,30 @@
-
-# Información del repositorio objetivo:
-repo: . 
+repo: ../revisor
 goals: PROJECT_GOALS.md
 ai_dir: AI
 
-# Información de los modelos a utilizar:
-reasoner: "ollama:deepseek-r1"
-aider_model: "ollama:qwen3-coder:14b"
+reasoner: "ollama:qwen2.5-coder:7b"
+aider_model: "ollama:qwen2.5-coder:7b"
+plan_mode: fast
+plan_max_tree_lines: 120
+plan_max_files: 4
+plan_max_file_chars: 2500
+plan_max_changes: 3
+plan_retry_on_timeout: false
+plan_fallback_reasoner: ""
+plan_fallback_timeout: 0
+reasoner_timeout: 60
+report_timeout: 2400
+aider_timeout: 900
+test_timeout: 1200
+apply_max_plan_changes: 1
+apply_limit_to_plan_files: true
+apply_enforce_plan_scope: true
+apply_skip_unsupported_plan_changes: true
 
-test_cmd: "pytest -q"
-lint_cmd: "ruff check . || true"
+test_cmd: "python3 -m compileall src main.py"
+lint_cmd: ""
+lint_required: false
 
-max_iters: 2
+max_iters: 1
 zip: true
+base_branch: master

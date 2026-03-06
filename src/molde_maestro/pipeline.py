@@ -2,43 +2,38 @@
 """
 pipeline.py — Repo improvement pipeline: plan (reasoner) -> apply (aider) -> test -> report.
 
-Now supports a repo config file (YAML/JSON) to avoid typing the same flags forever.
+Mejoras principales:
+- Soporte explícito para comandos shell en lint/test.
+- Preflight de herramientas, modelos, goals y estado del repo.
+- Preparación del repo para Aider (evita prompts típicos de .gitignore).
+- Lógica de rama base más segura.
+- Política configurable de lint: puede reportar o bloquear.
+- Mejor logging y mensajes de error.
 
 Config discovery order:
   1) --config <path>
-  2) <repo>/molde_maestro.yml
-  3) <repo>/molde_maestro.yaml
-  4) <repo>/molde_maestro.json
+  2) <cwd>/molde_maestro.yml
+  3) <cwd>/molde_maestro.yaml
+  4) <cwd>/molde_maestro.json
 
 CLI overrides config.
-
-If you run: `python pipeline.py` with no subcommand:
-  - If config exists -> defaults to `run`
-  - If no config -> prints help and exits
-
-Typical usage (Ollama local):
-  python pipeline.py run \
-    --repo /path/to/repo \
-    --goals PROJECT_GOALS.md \
-    --reasoner ollama:deepseek-r1 \
-    --aider-model ollama:qwen3-coder:14b \
-    --test-cmd "pytest -q" \
-    --lint-cmd "ruff check . || true" \
-    --max-iters 2 \
-    --zip
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
+import contextlib
 import dataclasses
 import datetime as dt
 import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import copy
 from pathlib import Path
 from typing import Optional, Tuple, List, Any, Dict
 
@@ -51,43 +46,50 @@ def now_stamp() -> str:
     return dt.datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
-def run_cmd(cmd: str | List[str], cwd: Path | None = None, env: dict | None = None,
-            check: bool = False, capture: bool = True, timeout: Optional[int] = None) -> Tuple[int, str, str]:
+def iso_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def truncate(s: str, max_chars: int) -> str:
+    if len(s) <= max_chars:
+        return s
+    return s[:max_chars] + "\n\n[TRUNCATED]\n"
+
+
+def normalize_model_markdown(raw: str, fallback_title: str) -> str:
     """
-    Run a shell command. Returns (returncode, stdout, stderr).
+    Keep the first markdown heading onward and strip common reasoning wrappers.
+    This avoids saving model preambles like "Thinking..." or <think> blocks.
     """
-    if isinstance(cmd, str):
-        args = shlex.split(cmd)
-    else:
-        args = cmd
-
-    proc = subprocess.run(
-        args,
-        cwd=str(cwd) if cwd else None,
-        env={**os.environ, **(env or {})},
-        text=True,
-        capture_output=capture,
-        check=False,
-        timeout=timeout,
-    )
-    if check and proc.returncode != 0:
-        raise RuntimeError(
-            f"Command failed ({proc.returncode}): {args}\n"
-            f"STDOUT:\n{proc.stdout}\n"
-            f"STDERR:\n{proc.stderr}"
-        )
-    return proc.returncode, proc.stdout, proc.stderr
+    cleaned = re.sub(r"<think>.*?</think>\s*", "", raw, flags=re.DOTALL | re.IGNORECASE).strip()
+    lines = cleaned.splitlines()
+    for idx, line in enumerate(lines):
+        if line.lstrip().startswith("#"):
+            return "\n".join(lines[idx:]).strip()
+    body = cleaned.strip()
+    return f"{fallback_title}\n\n{body}" if body else fallback_title
 
 
-def ensure_git_repo(repo: Path) -> None:
-    code, out, _ = run_cmd("git rev-parse --is-inside-work-tree", cwd=repo)
-    if code != 0 or out.strip() != "true":
-        raise SystemExit(f"Not a git repo: {repo}")
+def sanitize_plan_commands(plan_md: str, allowed_commands: List[str]) -> str:
+    if not allowed_commands:
+        return plan_md
+    replacement = "## Commands to validate\n" + "\n".join(f"- `{cmd}`" for cmd in allowed_commands[:4])
+    pattern = re.compile(r"## Commands to validate\s*\n(?:.*\n?)*?\Z", re.MULTILINE)
+    if pattern.search(plan_md):
+        return pattern.sub(replacement, plan_md).rstrip() + "\n"
+    return plan_md.rstrip() + "\n\n" + replacement + "\n"
 
 
 def safe_write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+
+def safe_unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
 
 
 def read_text(path: Path, default: str = "") -> str:
@@ -97,22 +99,239 @@ def read_text(path: Path, default: str = "") -> str:
         return default
 
 
-def truncate(s: str, max_chars: int) -> str:
-    if len(s) <= max_chars:
-        return s
-    return s[:max_chars] + "\n\n[TRUNCATED]\n"
+def require_nonempty(value: str, name: str, hint: str = "") -> None:
+    if not str(value or "").strip():
+        extra = f"\nSugerencia: {hint}" if hint else ""
+        raise SystemExit(f"Falta valor requerido: {name}.{extra}")
+
+
+def format_duration(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "n/a"
+    return f"{seconds:.2f}s"
+
+
+ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+
+def strip_ansi(text: str) -> str:
+    return ANSI_ESCAPE_RE.sub("", text)
+
+
+def to_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return strip_ansi(value.decode("utf-8", errors="replace"))
+    return strip_ansi(str(value))
+
+
+class ExecutionFailure(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        command: str = "",
+        returncode: Optional[int] = None,
+        stdout: str = "",
+        stderr: str = "",
+        timeout_seconds: Optional[int] = None,
+        status: str = "failed",
+    ) -> None:
+        super().__init__(message)
+        self.command = command
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.timeout_seconds = timeout_seconds
+        self.status = status
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "message": str(self),
+            "command": self.command,
+            "returncode": self.returncode,
+            "timeout_seconds": self.timeout_seconds,
+            "stdout": truncate(self.stdout, 12000),
+            "stderr": truncate(self.stderr, 12000),
+            "status": self.status,
+        }
+
+
+@dataclasses.dataclass
+class RunRecorder:
+    ai_dir: Path
+    command: str
+    repo: Path
+    config_path: Optional[Path] = None
+    metadata_name: str = "run-metadata.json"
+    metadata_path: Path = dataclasses.field(init=False)
+    metadata: Dict[str, Any] = dataclasses.field(init=False)
+    _started_perf: Dict[str, float] = dataclasses.field(default_factory=dict, init=False)
+
+    def __post_init__(self) -> None:
+        self.metadata_path = self.ai_dir / self.metadata_name
+        self.metadata = {
+            "command": self.command,
+            "repo": str(self.repo),
+            "ai_dir": str(self.ai_dir),
+            "config_path": str(self.config_path) if self.config_path else None,
+            "started_at": iso_now(),
+            "completed_at": None,
+            "status": "running",
+            "stages": [],
+            "error": None,
+        }
+        self.save()
+
+    def save(self) -> None:
+        safe_write(self.metadata_path, json.dumps(self.metadata, indent=2, ensure_ascii=False))
+
+    def _stage(self, name: str) -> Dict[str, Any]:
+        for stage in self.metadata["stages"]:
+            if stage["name"] == name:
+                return stage
+        stage = {
+            "name": name,
+            "start_time": None,
+            "end_time": None,
+            "duration_seconds": None,
+            "status": "pending",
+            "details": {},
+        }
+        self.metadata["stages"].append(stage)
+        return stage
+
+    def start_stage(self, name: str) -> None:
+        stage = self._stage(name)
+        stage["start_time"] = iso_now()
+        stage["end_time"] = None
+        stage["duration_seconds"] = None
+        stage["status"] = "running"
+        self._started_perf[name] = dt.datetime.now().timestamp()
+        self.save()
+        print(f"[{name}] started at {stage['start_time']}")
+
+    def finish_stage(self, name: str, status: str, details: Optional[Dict[str, Any]] = None) -> None:
+        stage = self._stage(name)
+        stage["end_time"] = iso_now()
+        start_perf = self._started_perf.pop(name, None)
+        duration = None if start_perf is None else max(0.0, dt.datetime.now().timestamp() - start_perf)
+        stage["duration_seconds"] = round(duration, 3) if duration is not None else None
+        stage["status"] = status
+        if details:
+            stage["details"].update(details)
+        self.save()
+        print(f"[{name}] {status} in {format_duration(stage['duration_seconds'])}")
+
+    def mark_stage_skipped(self, name: str, reason: str) -> None:
+        stage = self._stage(name)
+        stage["status"] = "skipped"
+        stage["details"]["reason"] = reason
+        if stage["start_time"] is None:
+            stage["start_time"] = iso_now()
+        stage["end_time"] = stage["start_time"]
+        stage["duration_seconds"] = 0.0
+        self.save()
+        print(f"[{name}] skipped ({reason})")
+
+    def fail_run(self, message: str, status: str = "failed", details: Optional[Dict[str, Any]] = None) -> None:
+        self.metadata["status"] = status
+        self.metadata["completed_at"] = iso_now()
+        self.metadata["error"] = {"message": message, "details": details or {}}
+        self.save()
+
+    def complete_run(self, status: str = "ok", details: Optional[Dict[str, Any]] = None) -> None:
+        self.metadata["status"] = status
+        self.metadata["completed_at"] = iso_now()
+        if details:
+            self.metadata["summary"] = details
+        self.save()
+
+
+def run_cmd(
+    cmd: str | List[str],
+    cwd: Path | None = None,
+    env: dict | None = None,
+    check: bool = False,
+    capture: bool = True,
+    timeout: Optional[int] = None,
+    use_shell: bool = False,
+    input_text: Optional[str] = None,
+) -> Tuple[int, str, str]:
+    """
+    Run a command and return (returncode, stdout, stderr).
+
+    - If cmd is str and use_shell=False -> shlex.split(cmd)
+    - If cmd is str and use_shell=True  -> run through shell
+    - If cmd is list -> run directly
+    """
+    if isinstance(cmd, str):
+        args = cmd if use_shell else shlex.split(cmd)
+    else:
+        if use_shell:
+            raise ValueError("use_shell=True no es compatible con cmd como lista.")
+        args = cmd
+
+    proc = subprocess.run(
+        args,
+        cwd=str(cwd) if cwd else None,
+        env={**os.environ, **(env or {})},
+        text=True,
+        input=input_text,
+        capture_output=capture,
+        check=False,
+        timeout=timeout,
+        shell=use_shell,
+    )
+    if check and proc.returncode != 0:
+        shown = args if isinstance(args, str) else " ".join(shlex.quote(x) for x in args)
+        raise RuntimeError(
+            f"Command failed ({proc.returncode}): {shown}\n"
+            f"STDOUT:\n{proc.stdout}\n"
+            f"STDERR:\n{proc.stderr}"
+        )
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def command_exists(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+def ensure_git_repo(repo: Path) -> None:
+    code, out, _ = run_cmd("git rev-parse --is-inside-work-tree", cwd=repo)
+    if code != 0 or out.strip() != "true":
+        raise SystemExit(f"No es un repo git válido: {repo}")
+
+
+def ensure_ai_dir(repo: Path, ai_dir_name: str) -> Path:
+    ai_dir = repo / (ai_dir_name or "AI")
+    ai_dir.mkdir(parents=True, exist_ok=True)
+    return ai_dir
+
+
+def resolve_goals_path(repo: Path, goals_value: str) -> Path:
+    goals_value = (goals_value or "").strip() or "PROJECT_GOALS.md"
+    gp = Path(goals_value).expanduser()
+    if gp.is_absolute():
+        return gp
+    return repo / gp
+
+
+def looks_like_shell_command(cmd: str) -> bool:
+    shell_markers = ["&&", "||", "|", ";", ">", "<", "$(", "`"]
+    return any(marker in cmd for marker in shell_markers)
 
 
 def repo_tree(repo: Path, max_lines: int = 600) -> str:
     """
-    Get a lightweight tracked file listing, excluding common junk.
+    Lightweight tracked file listing, excluding common junk.
     """
     code, out, err = run_cmd("git ls-files", cwd=repo, capture=True)
     if code != 0:
         return f"[Could not list files]\n{err}"
 
     files = out.strip().splitlines()
-
     skip_patterns = [
         r"^AI/.*",
         r"^\.git/.*",
@@ -122,6 +341,9 @@ def repo_tree(repo: Path, max_lines: int = 600) -> str:
         r"^\.venv/.*",
         r"^venv/.*",
         r"^__pycache__/.*",
+        r"^\.mypy_cache/.*",
+        r"^\.pytest_cache/.*",
+        r"^\.ruff_cache/.*",
     ]
     rx = re.compile("|".join(f"(?:{p})" for p in skip_patterns))
     files = [f for f in files if not rx.match(f)]
@@ -145,11 +367,6 @@ def head_file(repo: Path, rel: str, max_chars: int = 8000) -> str:
 # -----------------------------
 
 def _normalize_cfg_keys(cfg: Any) -> Any:
-    """
-    Normalize dict keys:
-      - replace '-' with '_'
-      - keep recursively for nested dicts/lists
-    """
     if isinstance(cfg, dict):
         out: Dict[str, Any] = {}
         for k, v in cfg.items():
@@ -161,26 +378,29 @@ def _normalize_cfg_keys(cfg: Any) -> Any:
     return cfg
 
 
-def load_config_file(repo: Path, config_path: str | None) -> tuple[dict, Optional[Path]]:
+def load_config_file(config_path: str | None) -> tuple[dict, Optional[Path]]:
     """
-    Load config from YAML or JSON. Default search order:
+    Load config from YAML or JSON.
+
+    Search order:
       1) --config path if provided
-      2) <repo>/molde_maestro.yml
-      3) <repo>/molde_maestro.yaml
-      4) <repo>/molde_maestro.json
-    Returns (config_dict, chosen_path_or_none)
+      2) <cwd>/molde_maestro.yml
+      3) <cwd>/molde_maestro.yaml
+      4) <cwd>/molde_maestro.json
     """
+    cwd = Path.cwd()
     candidates: List[Path] = []
+
     if config_path:
         cp = Path(config_path).expanduser()
         if not cp.is_absolute():
-            cp = repo / cp
+            cp = cwd / cp
         candidates.append(cp)
     else:
         candidates += [
-            repo / "molde_maestro.yml",
-            repo / "molde_maestro.yaml",
-            repo / "molde_maestro.json",
+            cwd / "molde_maestro.yml",
+            cwd / "molde_maestro.yaml",
+            cwd / "molde_maestro.json",
         ]
 
     chosen = next((p for p in candidates if p.exists()), None)
@@ -188,13 +408,18 @@ def load_config_file(repo: Path, config_path: str | None) -> tuple[dict, Optiona
         return {}, None
 
     suffix = chosen.suffix.lower()
-    raw: Any
 
     if suffix in (".yml", ".yaml"):
         try:
             import yaml  # type: ignore
         except ImportError:
-            raise SystemExit("Config YAML encontrado pero falta PyYAML. Instala: pip install pyyaml")
+            if config_path:
+                raise SystemExit("Hay config YAML pero falta PyYAML. Instala: pip install pyyaml")
+            print(
+                f"warning: se ignoró {chosen} porque falta PyYAML; continúa con flags/defaults.",
+                file=sys.stderr,
+            )
+            return {}, None
         raw = yaml.safe_load(chosen.read_text(encoding="utf-8")) or {}
     elif suffix == ".json":
         raw = json.loads(chosen.read_text(encoding="utf-8"))
@@ -203,18 +428,112 @@ def load_config_file(repo: Path, config_path: str | None) -> tuple[dict, Optiona
 
     cfg = _normalize_cfg_keys(raw)
     if not isinstance(cfg, dict):
-        raise SystemExit("El config debe ser un objeto (dict) en YAML/JSON.")
+        raise SystemExit("El config debe ser un objeto/dict en YAML o JSON.")
     return cfg, chosen
+
+
+def init_run_context(args) -> tuple[Path, Path, RunRecorder]:
+    repo = Path(args.repo).expanduser().resolve()
+    ai_dir = ensure_ai_dir(repo, args.ai_dir)
+    cfg_path = getattr(args, "_config_path", None)
+    metadata_name = "run-metadata.json"
+    if args.cmd == "report" and (ai_dir / "run-metadata.json").exists():
+        metadata_name = "report-command-metadata.json"
+    recorder = RunRecorder(ai_dir=ai_dir, command=args.cmd, repo=repo, config_path=cfg_path, metadata_name=metadata_name)
+    return repo, ai_dir, recorder
+
+
+def clear_artifacts(ai_dir: Path, names: List[str]) -> None:
+    for name in names:
+        safe_unlink(ai_dir / name)
+
+
+PLAN_MODE_PRESETS: Dict[str, Dict[str, int]] = {
+    "fast": {
+        "max_tree_lines": 120,
+        "max_files": 4,
+        "max_file_chars": 2500,
+        "max_changes": 3,
+    },
+    "balanced": {
+        "max_tree_lines": 300,
+        "max_files": 8,
+        "max_file_chars": 4500,
+        "max_changes": 5,
+    },
+    "deep": {
+        "max_tree_lines": 600,
+        "max_files": 12,
+        "max_file_chars": 8000,
+        "max_changes": 7,
+    },
+}
+
+
+def resolve_plan_settings(args, mode_override: Optional[str] = None) -> PlanSettings:
+    mode = (mode_override or args.plan_mode or "balanced").strip().lower()
+    if mode not in PLAN_MODE_PRESETS:
+        raise SystemExit(f"plan_mode inválido: {mode}. Usa fast, balanced o deep.")
+    preset = PLAN_MODE_PRESETS[mode]
+    return PlanSettings(
+        mode=mode,
+        max_tree_lines=args.plan_max_tree_lines or preset["max_tree_lines"],
+        max_files=args.plan_max_files or preset["max_files"],
+        max_file_chars=args.plan_max_file_chars or preset["max_file_chars"],
+        max_changes=args.plan_max_changes or preset["max_changes"],
+    )
+
+
+def effective_plan_fallback_timeout(args) -> int:
+    return args.plan_fallback_timeout or args.reasoner_timeout
+
+
+def build_plan_attempt_specs(args) -> List[PlanAttemptSpec]:
+    attempts: List[PlanAttemptSpec] = [
+        PlanAttemptSpec(
+            index=1,
+            mode=args.plan_mode,
+            reasoner=args.reasoner,
+            timeout=args.reasoner_timeout,
+            label="primary",
+        )
+    ]
+    next_index = 2
+    seen = {(args.plan_mode, args.reasoner)}
+
+    if args.plan_retry_on_timeout:
+        degraded = ("fast", args.reasoner)
+        if degraded not in seen:
+            attempts.append(
+                PlanAttemptSpec(
+                    index=next_index,
+                    mode="fast",
+                    reasoner=args.reasoner,
+                    timeout=args.reasoner_timeout,
+                    label="retry-fast",
+                )
+            )
+            seen.add(degraded)
+            next_index += 1
+
+        if args.plan_fallback_reasoner.strip():
+            fallback = ("fast", args.plan_fallback_reasoner.strip())
+            if fallback not in seen:
+                attempts.append(
+                    PlanAttemptSpec(
+                    index=next_index,
+                    mode="fast",
+                    reasoner=args.plan_fallback_reasoner.strip(),
+                    timeout=effective_plan_fallback_timeout(args),
+                    label="fallback-fast",
+                )
+                )
+    return attempts
 
 
 def merge_config_into_args(args: argparse.Namespace, cfg: dict) -> argparse.Namespace:
     """
-    CLI overrides config.
-    We only fill args fields when:
-      - field exists in args, and
-      - it looks "unset" or at its default-ish state.
-
-    We intentionally keep this simple and predictable.
+    CLI overrides config. Config only fills unset/default-ish values.
     """
     def has(field: str) -> bool:
         return hasattr(args, field)
@@ -225,33 +544,43 @@ def merge_config_into_args(args: argparse.Namespace, cfg: dict) -> argparse.Name
     def set_(field: str, value):
         setattr(args, field, value)
 
-    def empty_str(v): return (v is None) or (isinstance(v, str) and v.strip() == "")
-    def empty_list(v): return v is None or v == []
-    def default_int(v, default_val): return v is None or v == default_val
-
-    # Direct mappings (config_key -> args_field)
     mappings = {
         "repo": "repo",
         "goals": "goals",
         "ai_dir": "ai_dir",
         "extra_context": "extra_context",
         "max_tree_lines": "max_tree_lines",
-
         "reasoner": "reasoner",
         "aider_model": "aider_model",
         "test_cmd": "test_cmd",
         "lint_cmd": "lint_cmd",
-
         "max_iters": "max_iters",
         "zip": "zip",
-
         "branch": "branch",
         "base": "base",
-
-        "allowed_files": "allowed_file",   # convenience
+        "base_branch": "base",
         "allowed_file": "allowed_file",
+        "allowed_files": "allowed_file",
         "aider_extra_arg": "aider_extra_arg",
         "aider_extra_args": "aider_extra_arg",
+        "lint_required": "lint_required",
+        "allow_dirty_repo": "allow_dirty_repo",
+        "reasoner_timeout": "reasoner_timeout",
+        "report_timeout": "report_timeout",
+        "aider_timeout": "aider_timeout",
+        "test_timeout": "test_timeout",
+        "plan_mode": "plan_mode",
+        "plan_max_tree_lines": "plan_max_tree_lines",
+        "plan_max_files": "plan_max_files",
+        "plan_max_file_chars": "plan_max_file_chars",
+        "plan_max_changes": "plan_max_changes",
+        "plan_fallback_reasoner": "plan_fallback_reasoner",
+        "plan_fallback_timeout": "plan_fallback_timeout",
+        "plan_retry_on_timeout": "plan_retry_on_timeout",
+        "apply_max_plan_changes": "apply_max_plan_changes",
+        "apply_limit_to_plan_files": "apply_limit_to_plan_files",
+        "apply_enforce_plan_scope": "apply_enforce_plan_scope",
+        "apply_skip_unsupported_plan_changes": "apply_skip_unsupported_plan_changes",
     }
 
     for ck, af in mappings.items():
@@ -261,30 +590,39 @@ def merge_config_into_args(args: argparse.Namespace, cfg: dict) -> argparse.Name
         val = cfg[ck]
         cur = get(af)
 
-        # Decide unset-ness by type/field
         if isinstance(cur, str):
-            if empty_str(cur):
+            default_strings = {
+                "plan_mode": "balanced",
+                "plan_fallback_reasoner": "",
+            }
+            if not str(cur).strip() or (af in default_strings and cur == default_strings[af]):
                 set_(af, str(val))
         elif isinstance(cur, list):
-            if empty_list(cur) and isinstance(val, list):
+            if not cur and isinstance(val, list):
                 set_(af, val)
         elif isinstance(cur, bool):
-            # If CLI false and config true -> enable.
             if cur is False and bool(val) is True:
                 set_(af, True)
         elif isinstance(cur, int):
-            # Default-ish behavior: only override if args has its typical default.
-            # For max_iters default is 2, max_tree_lines default 600, etc.
-            if af == "max_iters" and default_int(cur, 2):
+            defaults = {
+                "max_iters": 2,
+                "max_tree_lines": 600,
+                "reasoner_timeout": 1800,
+                "report_timeout": 0,
+                "aider_timeout": 7200,
+                "test_timeout": 1800,
+                "plan_max_tree_lines": 0,
+                "plan_max_files": 0,
+                "plan_max_file_chars": 0,
+                "plan_max_changes": 0,
+                "plan_fallback_timeout": 0,
+                "apply_max_plan_changes": 0,
+            }
+            if af in defaults and cur == defaults[af]:
                 set_(af, int(val))
-            elif af == "max_tree_lines" and default_int(cur, 600):
+            elif cur in (0, None):
                 set_(af, int(val))
-            else:
-                # if it's zero/None-like
-                if cur in (0, None):
-                    set_(af, int(val))
         else:
-            # If unknown type, set only if None
             if cur is None:
                 set_(af, val)
 
@@ -292,7 +630,7 @@ def merge_config_into_args(args: argparse.Namespace, cfg: dict) -> argparse.Name
 
 
 # -----------------------------
-# Model interaction (Ollama / cmd)
+# Model interaction
 # -----------------------------
 
 @dataclasses.dataclass
@@ -301,12 +639,43 @@ class ModelSpec:
     name: str  # model name or command template
 
 
+@dataclasses.dataclass
+class PlanSettings:
+    mode: str
+    max_tree_lines: int
+    max_files: int
+    max_file_chars: int
+    max_changes: int
+
+
+@dataclasses.dataclass
+class PlanAttemptSpec:
+    index: int
+    mode: str
+    reasoner: str
+    timeout: int
+    label: str
+
+
+@dataclasses.dataclass
+class PlanChange:
+    index: int
+    title: str
+    files: List[str]
+    body: str
+
+
+@dataclasses.dataclass
+class ApplyScope:
+    selected_changes: List[PlanChange]
+    selected_files: List[str]
+    selected_plan_md: str
+    max_changes: int
+    source: str
+    skipped_change_titles: List[str]
+
+
 def parse_model_spec(s: str) -> ModelSpec:
-    """
-    Supported:
-      ollama:<model>     -> uses `ollama run <model>` with a prompt
-      cmd:<command...>   -> uses an arbitrary command that reads prompt from stdin and prints response
-    """
     if s.startswith("ollama:"):
         return ModelSpec(kind="ollama", name=s.split(":", 1)[1].strip())
     if s.startswith("cmd:"):
@@ -314,82 +683,509 @@ def parse_model_spec(s: str) -> ModelSpec:
     raise ValueError("Model must be specified as ollama:<model> or cmd:<...>")
 
 
+def normalize_aider_model_name(model: str) -> str:
+    model = model.strip()
+    if model.startswith("ollama:"):
+        return "ollama/" + model.split(":", 1)[1]
+    return model
+
+
+def parse_plan_changes(plan_md: str) -> List[PlanChange]:
+    changes: List[PlanChange] = []
+    pattern = re.compile(r"(?ms)^(\d+)\)\s+Change:\s*(.+?)\n(.*?)(?=^\d+\)\s+Change:|\Z)")
+    for match in pattern.finditer(plan_md):
+        index = int(match.group(1))
+        title = match.group(2).strip()
+        body = match.group(0).strip()
+        details = match.group(3)
+        files_line_match = re.search(r"^\s*-\s*Files:\s*(.+)$", details, re.MULTILINE)
+        files: List[str] = []
+        if files_line_match:
+            files_field = files_line_match.group(1).strip()
+            backtick_files = re.findall(r"`([^`]+)`", files_field)
+            candidates = backtick_files or re.split(r",|\band\b", files_field)
+            for candidate in candidates:
+                cleaned = re.sub(r"\(.*?\)", "", candidate).strip(" `*.-")
+                if not cleaned or cleaned.lower() in {"etc", "etc."}:
+                    continue
+                if "/" in cleaned or "." in cleaned:
+                    files.append(cleaned)
+        changes.append(PlanChange(index=index, title=title, files=list(dict.fromkeys(files)), body=body))
+    return changes
+
+
+def effective_apply_max_plan_changes(args) -> int:
+    if getattr(args, "apply_max_plan_changes", 0):
+        return int(args.apply_max_plan_changes)
+    return 1 if getattr(args, "plan_mode", "balanced") == "fast" else 0
+
+
+def load_repo_dependency_names(repo: Path) -> set[str]:
+    deps: set[str] = set()
+    requirements = repo / "requirements.txt"
+    if requirements.exists():
+        for raw_line in requirements.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            pkg = re.split(r"[<>=!~\[]", line, maxsplit=1)[0].strip().lower()
+            if pkg:
+                deps.add(pkg)
+    return deps
+
+
+DECLARED_DEP_ALIASES = {
+    "pillow": {"pil"},
+}
+
+
+def declared_import_names(repo: Path) -> set[str]:
+    names: set[str] = set()
+    for dep in load_repo_dependency_names(repo):
+        names.add(dep)
+        names.add(dep.replace("-", "_"))
+        names.update(DECLARED_DEP_ALIASES.get(dep, set()))
+    return names
+
+
+def extract_import_roots(source: str) -> set[str]:
+    roots: set[str] = set()
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return roots
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                roots.add(alias.name.split(".", 1)[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.level != 0 or not node.module:
+                continue
+            roots.add(node.module.split(".", 1)[0])
+    return roots
+
+
+def audit_python_dependency_declarations(repo: Path, changed_files: List[str]) -> Dict[str, Any]:
+    declared = declared_import_names(repo)
+    stdlib = {name.lower() for name in getattr(sys, "stdlib_module_names", set())}
+    local_roots = {path.parts[1] for path in (repo / "src").glob("*") if path.is_dir()} if (repo / "src").exists() else set()
+    issues: List[Dict[str, Any]] = []
+    for rel_path in changed_files:
+        if not rel_path.endswith(".py"):
+            continue
+        path = repo / rel_path
+        if not path.exists():
+            continue
+        imports = extract_import_roots(read_text(path))
+        missing = []
+        for root in sorted(imports):
+            lowered = root.lower()
+            if lowered in stdlib or lowered in declared or root in local_roots:
+                continue
+            missing.append(root)
+        if missing:
+            issues.append({"file": rel_path, "missing_dependencies": missing})
+    return {"ok": not issues, "issues": issues}
+
+
+def change_dependency_refs(change: PlanChange) -> List[str]:
+    refs: List[str] = []
+    for token in re.findall(r"`([^`]+)`", change.body):
+        cleaned = token.strip().rstrip("()").lower()
+        if not cleaned or "/" in cleaned or "." in cleaned:
+            continue
+        refs.append(cleaned)
+    return list(dict.fromkeys(refs))
+
+
+def change_is_repo_supported(repo: Path, change: PlanChange) -> bool:
+    declared_deps = load_repo_dependency_names(repo)
+    for dep in change_dependency_refs(change):
+        if dep and dep not in declared_deps:
+            return False
+    listed_files = [path for path in change.files if path]
+    if listed_files and not any((repo / rel_path).exists() for rel_path in listed_files):
+        return False
+    return True
+
+
+def resolve_apply_scope(repo: Path, plan_md: str, args) -> ApplyScope:
+    changes = parse_plan_changes(plan_md)
+    max_changes = effective_apply_max_plan_changes(args)
+    skipped_change_titles: List[str] = []
+    candidate_changes = changes
+    if getattr(args, "apply_skip_unsupported_plan_changes", False):
+        supported_changes: List[PlanChange] = []
+        for change in changes:
+            if change_is_repo_supported(repo, change):
+                supported_changes.append(change)
+            else:
+                skipped_change_titles.append(change.title)
+        if supported_changes:
+            candidate_changes = supported_changes
+    selected_changes = candidate_changes[:max_changes] if max_changes > 0 else candidate_changes
+    selected_plan_md = "\n\n".join(change.body for change in selected_changes).strip()
+    selected_files: List[str] = []
+    if getattr(args, "allowed_file", None):
+        selected_files = list(dict.fromkeys(args.allowed_file))
+        source = "cli"
+    elif getattr(args, "apply_limit_to_plan_files", True):
+        for change in selected_changes:
+            for rel_path in change.files:
+                if (repo / rel_path).exists():
+                    selected_files.append(rel_path)
+        selected_files = list(dict.fromkeys(selected_files))
+        source = "plan"
+    else:
+        source = "unrestricted"
+    return ApplyScope(
+        selected_changes=selected_changes,
+        selected_files=selected_files,
+        selected_plan_md=selected_plan_md,
+        max_changes=max_changes,
+        source=source,
+        skipped_change_titles=skipped_change_titles,
+    )
+
+
+def stringify_command(args: List[str]) -> str:
+    return " ".join(shlex.quote(arg) for arg in args)
+
+
 def call_model(model: ModelSpec, prompt: str, cwd: Optional[Path] = None, timeout: int = 1800) -> str:
-    """
-    Calls a model and returns its output.
-    - ollama:<model>: uses `ollama run <model>`
-    - cmd:<...>: executes command and feeds prompt to stdin
-    """
     if model.kind == "ollama":
         args = ["ollama", "run", model.name]
     else:
         args = shlex.split(model.name)
 
-    proc = subprocess.run(
-        args,
-        input=prompt,
-        cwd=str(cwd) if cwd else None,
-        text=True,
-        capture_output=True,
-        timeout=timeout,
-        env=os.environ.copy(),
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"Model call failed ({proc.returncode}).\n"
-            f"STDERR:\n{proc.stderr}\n"
-            f"STDOUT:\n{proc.stdout}\n"
+    try:
+        proc = subprocess.run(
+            args,
+            input=prompt,
+            cwd=str(cwd) if cwd else None,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            env=os.environ.copy(),
         )
-    return proc.stdout.strip()
+    except subprocess.TimeoutExpired as exc:
+        raise ExecutionFailure(
+            f"Model call timed out after {timeout}s.",
+            command=stringify_command(args),
+            stdout=to_text(exc.stdout),
+            stderr=to_text(exc.stderr),
+            timeout_seconds=timeout,
+            status="timeout",
+        ) from exc
+    if proc.returncode != 0:
+        raise ExecutionFailure(
+            f"Model call failed ({proc.returncode}).",
+            command=stringify_command(args),
+            returncode=proc.returncode,
+            stdout=proc.stdout,
+            stderr=proc.stderr,
+            status="failed",
+        )
+    return proc.stdout
+
+
+def validate_model_available(model: ModelSpec) -> None:
+    if model.kind == "ollama":
+        if not command_exists("ollama"):
+            raise SystemExit("No se encontró 'ollama' en PATH.")
+        rc, out, err = run_cmd(["ollama", "list"], capture=True, timeout=60)
+        if rc != 0:
+            raise SystemExit(f"No pude consultar 'ollama list'.\n{err}")
+        available = {line.split()[0] for line in out.splitlines()[1:] if line.strip()}
+        if model.name not in available and f"{model.name}:latest" not in available:
+            raise SystemExit(f"El modelo Ollama no parece estar disponible: {model.name}")
+    elif model.kind == "cmd":
+        first = shlex.split(model.name)[0]
+        if not command_exists(first):
+            raise SystemExit(f"No se encontró el ejecutable del modelo cmd: {first}")
+
+
+def effective_report_timeout(args) -> int:
+    return args.report_timeout or args.reasoner_timeout
+
+
+def save_model_artifacts(ai_dir: Path, prefix: str, prompt: str, raw: Optional[str] = None) -> None:
+    safe_write(ai_dir / f"{prefix}-prompt.txt", prompt)
+    if raw is not None:
+        safe_write(ai_dir / f"{prefix}-raw.txt", raw)
+
+
+def write_stage_error(ai_dir: Path, stage: str, exc: BaseException, extra: Optional[Dict[str, Any]] = None) -> Path:
+    error_path = ai_dir / f"{stage}-error.md"
+    details: Dict[str, Any] = {
+        "error_type": type(exc).__name__,
+        "message": str(exc),
+    }
+    if isinstance(exc, ExecutionFailure):
+        details.update(exc.to_dict())
+    elif isinstance(exc, subprocess.TimeoutExpired):
+        details.update(
+            {
+                "command": to_text(exc.cmd),
+                "timeout_seconds": exc.timeout,
+                "stdout": truncate(to_text(exc.stdout), 12000),
+                "stderr": truncate(to_text(exc.stderr), 12000),
+                "status": "timeout",
+            }
+        )
+    if extra:
+        details.update(extra)
+
+    parts = [
+        f"# {stage.title()} Error",
+        "",
+        f"- error_type: `{details.get('error_type', type(exc).__name__)}`",
+        f"- message: {details.get('message', str(exc))}",
+    ]
+    for key in ("status", "command", "returncode", "timeout_seconds"):
+        if details.get(key) not in (None, ""):
+            parts.append(f"- {key}: `{details[key]}`")
+    if details.get("stdout"):
+        parts.append("\n## STDOUT\n```text\n" + details["stdout"] + "\n```")
+    if details.get("stderr"):
+        parts.append("\n## STDERR\n```text\n" + details["stderr"] + "\n```")
+    context_keys = [k for k in details if k not in {"error_type", "message", "status", "command", "returncode", "timeout_seconds", "stdout", "stderr"}]
+    if context_keys:
+        context = {k: details[k] for k in context_keys}
+        parts.append("\n## Context\n```json\n" + json.dumps(context, indent=2, ensure_ascii=False) + "\n```")
+    safe_write(error_path, "\n".join(parts) + "\n")
+    return error_path
+
+
+@contextlib.contextmanager
+def record_stage(recorder: RunRecorder, stage_name: str):
+    recorder.start_stage(stage_name)
+    stage_details: Dict[str, Any] = {}
+    try:
+        yield stage_details
+    except BaseException as exc:
+        status = "timeout" if isinstance(exc, (subprocess.TimeoutExpired,)) else "failed"
+        if isinstance(exc, ExecutionFailure):
+            status = exc.status
+        recorder.finish_stage(stage_name, status, stage_details)
+        raise
+    else:
+        status = stage_details.pop("__status", "ok")
+        recorder.finish_stage(stage_name, status, stage_details)
 
 
 # -----------------------------
-# Aider interaction
+# Git helpers
 # -----------------------------
 
-def run_aider(repo: Path, aider_model: str, message: str,
-              files: Optional[List[str]] = None,
-              log_path: Optional[Path] = None,
-              extra_args: Optional[List[str]] = None,
-              timeout: int = 7200) -> Tuple[int, str, str]:
+def git_current_branch(repo: Path) -> str:
+    _, out, _ = run_cmd("git rev-parse --abbrev-ref HEAD", cwd=repo, check=True)
+    return out.strip()
+
+
+def git_head_commit(repo: Path) -> str:
+    _, out, _ = run_cmd("git rev-parse HEAD", cwd=repo, check=True)
+    return out.strip()
+
+
+def git_changed_files_between(repo: Path, base_ref: str, head_ref: str = "HEAD") -> List[str]:
+    code, out, _ = run_cmd(["git", "diff", "--name-only", f"{base_ref}..{head_ref}"], cwd=repo)
+    if code != 0:
+        return []
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def git_checkout(repo: Path, branch: str) -> None:
+    run_cmd(f"git checkout {shlex.quote(branch)}", cwd=repo, check=True)
+
+
+def git_create_branch(repo: Path, branch_name: str) -> None:
+    run_cmd(f"git checkout -b {shlex.quote(branch_name)}", cwd=repo, check=True)
+
+
+def git_status_porcelain(repo: Path) -> str:
+    _, out, _ = run_cmd("git status --porcelain", cwd=repo)
+    return out.strip()
+
+
+def git_ref_exists(repo: Path, ref: str) -> bool:
+    code, _, _ = run_cmd(["git", "rev-parse", "--verify", ref], cwd=repo)
+    return code == 0
+
+
+def git_archive_zip(repo: Path, out_zip: Path, ref: str = "HEAD") -> None:
+    out_zip.parent.mkdir(parents=True, exist_ok=True)
+    run_cmd(["git", "archive", "--format=zip", "-o", str(out_zip), ref], cwd=repo, check=True)
+
+
+def resolve_base_branch(repo: Path, requested_base: str = "") -> str:
+    requested_base = (requested_base or "").strip()
+    if requested_base:
+        if not git_ref_exists(repo, requested_base):
+            raise SystemExit(f"La rama/ref base no existe: {requested_base}")
+        return requested_base
+
+    current = git_current_branch(repo)
+    if current.startswith("ai/"):
+        for candidate in ("main", "master"):
+            if git_ref_exists(repo, candidate):
+                return candidate
+    return current
+
+
+def infer_base_ref(repo: Path) -> str:
+    code, out, _ = run_cmd("git rev-parse --abbrev-ref --symbolic-full-name @{u}", cwd=repo)
+    if code == 0:
+        upstream = out.strip()
+        code2, out2, _ = run_cmd(f"git merge-base HEAD {shlex.quote(upstream)}", cwd=repo)
+        if code2 == 0 and out2.strip():
+            return out2.strip()
+    return "HEAD~1"
+
+
+def collect_git_diff(repo: Path, base_ref: str) -> str:
+    code, out, err = run_cmd(f"git diff {shlex.quote(base_ref)}...HEAD", cwd=repo, capture=True)
+    if code != 0:
+        return f"[git diff failed]\n{err}"
+    return truncate(out, 20000)
+
+
+def collect_git_changed_files(repo: Path, base_ref: str) -> List[str]:
+    code, out, _ = run_cmd(["git", "diff", "--name-only", f"{base_ref}...HEAD"], cwd=repo, capture=True)
+    if code != 0:
+        return []
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+# -----------------------------
+# Aider preparation / interaction
+# -----------------------------
+
+DEFAULT_AIDER_GITIGNORE_PATTERNS = [
+    ".aider*",
+    ".env",
+    ".venv/",
+    "venv/",
+    "__pycache__/",
+    "*.pyc",
+    ".pytest_cache/",
+    ".ruff_cache/",
+    ".mypy_cache/",
+]
+
+
+AIDER_FATAL_MARKERS = [
+    "litellm.BadRequestError",
+    "LLM Provider NOT provided",
+    "Traceback (most recent call last):",
+]
+
+
+def ensure_repo_ready_for_aider(repo: Path) -> None:
     """
-    Runs aider in non-interactive mode (common CLI):
-      aider --model <...> --auto-commits --message "<...>" [--file ...]
+    Make the target repo less likely to trigger interactive Aider prompts,
+    especially around .gitignore.
     """
-    cmd = ["aider", "--model", aider_model, "--auto-commits"]
+    gitignore = repo / ".gitignore"
+    existing = read_text(gitignore, default="")
+    missing = [p for p in DEFAULT_AIDER_GITIGNORE_PATTERNS if p not in existing]
+
+    if missing:
+        parts = [existing.rstrip()] if existing.strip() else []
+        parts.append("# Aider / local artifacts")
+        parts.extend(missing)
+        new_content = "\n".join(parts).rstrip() + "\n"
+        safe_write(gitignore, new_content)
+
+
+def run_aider(
+    repo: Path,
+    aider_model: str,
+    message: str,
+    files: Optional[List[str]] = None,
+    log_path: Optional[Path] = None,
+    extra_args: Optional[List[str]] = None,
+    timeout: int = 7200,
+) -> Tuple[int, str, str]:
+    """
+    Run Aider in as non-interactive a way as possible.
+    """
+    base_cmd = [
+        "aider",
+        "--model", normalize_aider_model_name(aider_model),
+        "--auto-commits",
+        "--yes-always",
+        "--no-show-model-warnings",
+        "--no-check-model-accepts-settings",
+    ]
 
     if files:
         for f in files:
-            cmd += ["--file", f]
+            base_cmd += ["--file", f]
 
-    cmd += ["--message", message]
+    base_cmd += ["--message", message]
 
     if extra_args:
-        cmd += extra_args
+        base_cmd += extra_args
 
-    proc = subprocess.run(
-        cmd,
-        cwd=str(repo),
-        text=True,
-        capture_output=True,
-        timeout=timeout,
-        env=os.environ.copy(),
-    )
+    try:
+        proc = subprocess.run(
+            base_cmd,
+            cwd=str(repo),
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            env=os.environ.copy(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = to_text(exc.stdout)
+        stderr = to_text(exc.stderr)
+        if log_path:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            existing = read_text(log_path, default="")
+            block = (
+                f"{existing}\n\n" if existing.strip() else ""
+            ) + (
+                f"# Aider run ({now_stamp()})\n\n"
+                f"## CMD\n```bash\n{stringify_command(base_cmd)}\n```\n\n"
+                f"## RESULT\nTimed out after {timeout}s\n\n"
+                f"## STDOUT\n```text\n{stdout}\n```\n\n"
+                f"## STDERR\n```text\n{stderr}\n```\n"
+            )
+            safe_write(log_path, block)
+        raise ExecutionFailure(
+            f"Aider timed out after {timeout}s.",
+            command=stringify_command(base_cmd),
+            stdout=stdout,
+            stderr=stderr,
+            timeout_seconds=timeout,
+            status="timeout",
+        ) from exc
 
     if log_path:
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text(
+        existing = read_text(log_path, default="")
+        block = (
+            f"{existing}\n\n" if existing.strip() else ""
+        ) + (
             f"# Aider run ({now_stamp()})\n\n"
-            f"## CMD\n```\n{' '.join(shlex.quote(c) for c in cmd)}\n```\n\n"
-            f"## STDOUT\n```\n{proc.stdout}\n```\n\n"
-            f"## STDERR\n```\n{proc.stderr}\n```\n",
-            encoding="utf-8"
+            f"## CMD\n```bash\n{stringify_command(base_cmd)}\n```\n\n"
+            f"## RETURN CODE\n{proc.returncode}\n\n"
+            f"## STDOUT\n```text\n{proc.stdout}\n```\n\n"
+            f"## STDERR\n```text\n{proc.stderr}\n```\n"
         )
+        safe_write(log_path, block)
+
     return proc.returncode, proc.stdout, proc.stderr
 
 
+def aider_output_has_fatal_error(stdout: str, stderr: str) -> bool:
+    combined = f"{stdout}\n{stderr}"
+    return any(marker in combined for marker in AIDER_FATAL_MARKERS)
+
+
 # -----------------------------
-# Pipeline steps
+# Reasoner / report prompts
 # -----------------------------
 
 PLAN_TEMPLATE = """\
@@ -418,26 +1214,131 @@ PLAN_TEMPLATE = """\
 """
 
 
-def build_reasoner_prompt(repo: Path, goals_text: str, extra_context_files: List[str],
-                          max_tree_lines: int = 600) -> str:
-    tree = repo_tree(repo, max_lines=max_tree_lines)
+FAST_PLAN_STRUCTURE = """\
+# Repo Review Plan
+## Summary
+- ...
+## Assumptions
+- ...
+## Changes (ordered)
+1) Change: ...
+   - Files: ...
+   - Rationale: ...
+   - Acceptance criteria:
+     - ...
+   - Tests:
+     - ...
+## Non-goals
+- ...
+## Commands to validate
+- ...
+"""
 
+
+def select_plan_context_files(repo: Path, extra_context_files: List[str], max_files: int) -> List[str]:
     key_candidates = [
-        "README.md", "pyproject.toml", "requirements.txt", "package.json",
-        "Makefile", "justfile", "setup.cfg", "Cargo.toml", "go.mod",
-        ".github/workflows/ci.yml", ".github/workflows/test.yml"
+        "README.md",
+        "pyproject.toml",
+        "requirements.txt",
+        "package.json",
+        "Makefile",
+        "justfile",
+        "setup.cfg",
+        "Cargo.toml",
+        "go.mod",
+        "main.py",
+        ".github/workflows/ci.yml",
+        ".github/workflows/test.yml",
     ]
-
     selected: List[str] = []
-    for k in key_candidates + extra_context_files:
-        if k and k not in selected and (repo / k).exists():
-            selected.append(k)
+    for candidate in key_candidates + extra_context_files:
+        if candidate and candidate not in selected and (repo / candidate).exists():
+            selected.append(candidate)
+        if len(selected) >= max_files:
+            break
+    return selected
 
+
+def detect_validation_commands(repo: Path, args) -> List[str]:
+    commands: List[str] = []
+    for candidate in [getattr(args, "lint_cmd", ""), getattr(args, "test_cmd", "")]:
+        if str(candidate or "").strip():
+            commands.append(str(candidate).strip())
+    if commands:
+        return commands
+
+    if (repo / "tests").exists() or (repo / "pytest.ini").exists():
+        commands.append("pytest -q")
+    if (repo / "pyproject.toml").exists() or (repo / "requirements.txt").exists():
+        compile_parts = []
+        if (repo / "src").exists():
+            compile_parts.append("src")
+        if (repo / "main.py").exists():
+            compile_parts.append("main.py")
+        if compile_parts:
+            commands.append(f"python3 -m compileall {' '.join(compile_parts)}")
+    if (repo / "package.json").exists():
+        commands.append("npm test")
+    if (repo / "Cargo.toml").exists():
+        commands.append("cargo test")
+    if (repo / "go.mod").exists():
+        commands.append("go test ./...")
+    return commands[:4]
+
+
+def build_reasoner_prompt(
+    repo: Path,
+    goals_text: str,
+    extra_context_files: List[str],
+    settings: PlanSettings,
+    validation_commands: List[str],
+) -> str:
+    tree = repo_tree(repo, max_lines=settings.max_tree_lines)
+    selected = select_plan_context_files(repo, extra_context_files, settings.max_files)
     key_blobs: List[str] = []
-    for k in selected[:12]:
-        key_blobs.append(f"\n\n### FILE: {k}\n```text\n{head_file(repo, k)}\n```")
+    for path in selected:
+        key_blobs.append(
+            f"\n\n### FILE: {path}\n```text\n{head_file(repo, path, max_chars=settings.max_file_chars)}\n```"
+        )
+    validation_block = "\n".join(f"- {cmd}" for cmd in validation_commands) or "- [no clear validation command detected]"
 
-    prompt = f"""\
+    if settings.mode == "fast":
+        return f"""\
+You are a senior engineer preparing a short implementation plan for a repository.
+Output ONLY Markdown for plan.md. No preamble. No code fences around the whole answer.
+
+Use EXACTLY this structure:
+{FAST_PLAN_STRUCTURE}
+
+STRICT RULES:
+- Propose at most {settings.max_changes} changes.
+- Keep every section concise.
+- No style-only refactors.
+- Only propose changes that are implementable with the files and dependencies already present in the repo context.
+- Do not rely on adding new third-party dependencies in fast mode.
+- Summary, Assumptions, Non-goals: max 3 bullets each.
+- Commands to validate: max 4 exact commands.
+- Use only commands from the allowed validation list below.
+- Rationale: one sentence per change.
+- Acceptance criteria: max 3 bullets per change.
+- Tests: max 2 bullets per change.
+
+INPUTS:
+
+## PROJECT_GOALS.md
+{truncate(goals_text, 2500)}
+
+## REPO FILE LIST (truncated)
+{tree}
+{''.join(key_blobs)}
+
+## ALLOWED VALIDATION COMMANDS
+{validation_block}
+
+Now output the final Markdown for plan.md only.
+"""
+
+    return f"""\
 You are a meticulous senior engineer. You will review a repository and produce a single Markdown document called plan.md
 following EXACTLY the required structure below. Do not include anything before the Markdown. Do not wrap it in code fences.
 
@@ -450,74 +1351,91 @@ CONSTRAINTS:
 - Respect the goals in PROJECT_GOALS.md.
 - Do NOT propose irrelevant refactors or style-only churn.
 - In "Commands to validate", include exact commands that match the repo tooling you see.
+- Use only commands from the allowed validation list below.
+- Propose at most {settings.max_changes} changes.
 
 INPUTS:
 
 ## PROJECT_GOALS.md
-{goals_text}
+{truncate(goals_text, settings.max_file_chars)}
 
 ## REPO FILE LIST (git ls-files)
 {tree}
 {''.join(key_blobs)}
 
+## ALLOWED VALIDATION COMMANDS
+{validation_block}
+
 Now output the final Markdown for plan.md only.
 """
-    return prompt
 
 
-def git_current_branch(repo: Path) -> str:
-    _, out, _ = run_cmd("git rev-parse --abbrev-ref HEAD", cwd=repo, check=True)
-    return out.strip()
-
-
-def git_create_branch(repo: Path, branch_name: str) -> None:
-    run_cmd(f"git checkout -b {shlex.quote(branch_name)}", cwd=repo, check=True)
-
-
-def git_checkout(repo: Path, branch: str) -> None:
-    run_cmd(f"git checkout {shlex.quote(branch)}", cwd=repo, check=True)
-
-
-def git_status_porcelain(repo: Path) -> str:
-    _, out, _ = run_cmd("git status --porcelain", cwd=repo)
-    return out.strip()
-
-
-def git_archive_zip(repo: Path, out_zip: Path, ref: str = "HEAD") -> None:
-    out_zip.parent.mkdir(parents=True, exist_ok=True)
-    run_cmd(["git", "archive", "--format=zip", "-o", str(out_zip), ref], cwd=repo, check=True)
-
-
-def default_aider_instruction(plan_md: str) -> str:
+def default_aider_instruction(
+    plan_md: str,
+    *,
+    selected_plan_md: str = "",
+    allowed_files: Optional[List[str]] = None,
+    validation_commands: Optional[List[str]] = None,
+    plan_mode: str = "balanced",
+) -> str:
+    scope_lines = []
+    if selected_plan_md.strip():
+        scope_lines.append("Implement ONLY the selected change subset below.")
+    if allowed_files:
+        scope_lines.append("Do not edit files outside this allowlist:")
+        scope_lines.extend(f"- {path}" for path in allowed_files)
+    if validation_commands:
+        scope_lines.append("Use these validation commands if you need to verify the change:")
+        scope_lines.extend(f"- {cmd}" for cmd in validation_commands[:4])
+    if plan_mode == "fast":
+        scope_lines.append("In fast mode, stop after the first cohesive implementation that satisfies the selected change.")
+    scope_block = "\n".join(scope_lines).strip()
+    selected_block = selected_plan_md.strip() or plan_md.strip()
     return f"""\
 You are Aider acting as an engineer implementing a prepared change plan.
 
 You MUST follow this plan strictly:
 - Read AI/plan.md.
-- Implement the changes in order.
-- Update or add tests as specified.
-- Update docs if needed.
+- Read the selected scope below and treat it as the execution boundary.
+- Implement only high-confidence changes that are directly supported by the current repo.
+- Prefer the smallest useful change set over a broad speculative rewrite.
+- Implement the selected changes in order.
+- Update or add tests only if the selected change truly requires it.
+- Do not touch README or docs unless the selected scope explicitly requires it.
 - Do not introduce unrelated refactors.
+- Do not invent files, tests, scripts or commands that are not already justified by the repo.
+- Do not add new dependencies unless the repo already declares them or the selected scope explicitly requires them.
 - Keep commits small and meaningful (auto-commits is enabled).
 
 After completing changes, ensure the repo is left in a runnable state.
 
-PLAN:
-{plan_md}
+EXECUTION SCOPE:
+{scope_block or "- Keep scope minimal and explicit."}
+
+SELECTED PLAN:
+{selected_block}
 """
 
 
-def build_report_prompt(goals_text: str, plan_text: str, test_report_md: str, git_diff: str) -> str:
+def build_report_prompt(
+    goals_text: str,
+    plan_text: str,
+    test_report_md: str,
+    git_diff: str,
+    run_metadata: str = "",
+) -> str:
     return f"""\
 You are a strict reviewer. Produce a Markdown report called final.md.
 Do not wrap output in code fences.
 
 The report must include:
 1) Executive summary (what changed, why)
+   - State clearly if the run was fully successful or only partially successful.
 2) Goals coverage (map each goal -> evidence from changes/tests)
 3) Test results interpretation (pass/fail, what it means)
 4) Risks and regressions
 5) Next steps (concrete)
+6) Stage status summary (snapshot/plan/apply/test/report from the metadata)
 
 INPUTS:
 
@@ -530,6 +1448,9 @@ INPUTS:
 ## AI/test-report.md
 {test_report_md}
 
+## AI/run-metadata.json
+{run_metadata or "[Missing run metadata]"}
+
 ## git diff (against base)
 {git_diff}
 
@@ -537,403 +1458,992 @@ Now output final.md only.
 """
 
 
-def collect_git_diff(repo: Path, base_ref: str) -> str:
-    code, out, err = run_cmd(f"git diff {shlex.quote(base_ref)}...HEAD", cwd=repo, capture=True)
-    if code != 0:
-        return f"[git diff failed]\n{err}"
-    return truncate(out, 20000)
+def build_fallback_final_report(
+    metadata: Dict[str, Any],
+    plan_text: str = "",
+    test_report_md: str = "",
+) -> str:
+    stage_lines = []
+    for stage in metadata.get("stages", []):
+        stage_lines.append(
+            f"- {stage['name']}: {stage.get('status', 'unknown')} "
+            f"({format_duration(stage.get('duration_seconds'))})"
+        )
+    apply_details = next(
+        (stage.get("details", {}) for stage in metadata.get("stages", []) if stage.get("name") == "apply"),
+        {},
+    )
+    changed_files = apply_details.get("changed_files") or []
+    changed_file_lines = [f"- `{path}`" for path in changed_files] or ["- No committed changes were recorded."]
+    error = metadata.get("error") or {}
+    error_message = error.get("message", "No recorded error.")
+    plan_summary = []
+    for change in parse_plan_changes(plan_text)[:3]:
+        plan_summary.append(f"- Change {change.index}: {change.title}")
+    if not plan_summary:
+        plan_summary = ["- No parsed plan changes available."]
+    test_status = next(
+        (stage.get("status") for stage in metadata.get("stages", []) if stage.get("name") == "test"),
+        "not_run",
+    )
+    return "\n".join(
+        [
+            "# Final Report",
+            "",
+            "## Executive summary",
+            f"- Overall status: **{metadata.get('status', 'unknown')}**.",
+            f"- Error: {error_message}",
+            f"- Test stage status: **{test_status}**.",
+            "",
+            "## Goals coverage",
+            "- This fallback report is based on recorded stage metadata, not a successful reviewer model summary.",
+            "- Review AI/plan.md and git history for full intent vs. execution.",
+            "",
+            "## Planned changes",
+            *plan_summary,
+            "",
+            "## Applied changes",
+            *changed_file_lines,
+            "",
+            "## Test results interpretation",
+            f"- {test_status}: see AI/test-report.md for details." if test_report_md.strip() else "- No test report was produced.",
+            "",
+            "## Risks and regressions",
+            "- This run did not complete cleanly, so the repo may be partially modified or unchanged.",
+            "- Any missing report sections should be treated as unknown, not successful.",
+            "",
+            "## Next steps",
+            "- Inspect AI/* artifacts for the failed stage and the exact command output.",
+            "- Narrow scope further or adjust model/timeouts before rerunning.",
+            "",
+            "## Stage status summary",
+            *stage_lines,
+            "",
+        ]
+    )
 
 
-def write_test_report(repo: Path, ai_dir: Path, lint_cmd: Optional[str], test_cmd: str) -> Tuple[bool, str]:
+def build_grounded_final_report(
+    metadata: Dict[str, Any],
+    plan_text: str,
+    test_report_md: str,
+    changed_files: List[str],
+    git_diff: str,
+) -> str:
+    stage_status = {stage["name"]: stage.get("status", "unknown") for stage in metadata.get("stages", [])}
+    stage_lines = [
+        f"- {stage['name']}: {stage.get('status', 'unknown')} ({format_duration(stage.get('duration_seconds'))})"
+        for stage in metadata.get("stages", [])
+    ]
+    plan_changes = parse_plan_changes(plan_text)
+    plan_lines = [f"- Change {change.index}: {change.title}" for change in plan_changes] or ["- No parsed plan changes."]
+    changed_file_lines = [f"- `{path}`" for path in changed_files] or ["- No committed files detected."]
+    overall_status = metadata.get("status", "unknown")
+    tests_status = stage_status.get("test", "not_run")
+    fully_successful = overall_status == "ok" and tests_status == "ok"
+    apply_details = next(
+        (stage.get("details", {}) for stage in metadata.get("stages", []) if stage.get("name") == "apply"),
+        {},
+    )
+    selected_titles = apply_details.get("selected_change_titles") or []
+    selected_lines = [f"- {title}" for title in selected_titles] or ["- No selected change titles recorded."]
+    test_summary_line = "- No test report was produced."
+    if test_report_md.strip():
+        match = re.search(r"- stage_status: \*\*(.+?)\*\*", test_report_md)
+        if match:
+            test_summary_line = f"- Test report status: **{match.group(1)}**."
+        else:
+            test_summary_line = "- Test report exists in AI/test-report.md."
+    diff_excerpt = truncate(git_diff.strip(), 4000) if git_diff.strip() else "[No git diff recorded]"
+    return "\n".join(
+        [
+            "# Final Report",
+            "",
+            "## Executive Summary",
+            f"- Overall status: **{overall_status}**.",
+            f"- Fully successful: **{'yes' if fully_successful else 'no'}**.",
+            f"- Selected plan scope: {', '.join(selected_titles) if selected_titles else 'not recorded'}.",
+            f"- Committed files: {', '.join(changed_files) if changed_files else 'none'}.",
+            "",
+            "## Goals Coverage",
+            "- Planned changes:",
+            *plan_lines,
+            "- Selected changes sent to apply:",
+            *selected_lines,
+            "- Actual committed files:",
+            *changed_file_lines,
+            "",
+            "## Test Results Interpretation",
+            test_summary_line,
+            "- Current validation only proves the repo still compiles under `python3 -m compileall src main.py`.",
+            "",
+            "## Risks and Regressions",
+            "- This report is grounded on metadata and git diff to avoid hallucinated success claims.",
+            "- A green compile check is weaker than behavioral tests; functional regressions may still exist.",
+            "- Review the actual diff before treating the change as complete.",
+            "",
+            "## Next Steps",
+            "- Inspect the committed diff and decide whether the applied change is functionally sufficient.",
+            "- Strengthen `test_cmd` when the target repo has installable dependencies or sample fixtures.",
+            "- If the first plan change remains too ambitious, keep `apply` limited to one scoped change per run.",
+            "",
+            "## Stage Status Summary",
+            *stage_lines,
+            "",
+            "## Git Diff Excerpt",
+            "```diff",
+            diff_excerpt,
+            "```",
+            "",
+        ]
+    )
+
+
+def project_reported_metadata(metadata: Dict[str, Any], overall_status: Optional[str] = None) -> Dict[str, Any]:
+    projected = copy.deepcopy(metadata)
+    if overall_status:
+        projected["status"] = overall_status
+    for stage in projected.get("stages", []):
+        if stage.get("name") == "report":
+            stage["status"] = "ok"
+    return projected
+
+
+def run_plan_generation(
+    repo: Path,
+    ai_dir: Path,
+    goals_text: str,
+    args,
+) -> Tuple[str, Dict[str, Any]]:
+    attempts = build_plan_attempt_specs(args)
+    validation_commands = detect_validation_commands(repo, args)
+    clear_artifacts(
+        ai_dir,
+        [
+            "plan.md",
+            "plan-prompt.txt",
+            "plan-raw.txt",
+            "plan-error.md",
+            "plan-attempts.json",
+        ],
+    )
+    attempt_records: List[Dict[str, Any]] = []
+    last_exc: Optional[BaseException] = None
+
+    for attempt in attempts:
+        settings = resolve_plan_settings(args, mode_override=attempt.mode)
+        prompt = build_reasoner_prompt(repo, goals_text, args.extra_context, settings, validation_commands)
+        attempt_prefix = f"plan-attempt-{attempt.index}"
+        save_model_artifacts(ai_dir, attempt_prefix, prompt)
+        safe_write(ai_dir / "plan-prompt.txt", prompt)
+        print(
+            "plan: attempt "
+            f"{attempt.index}/{len(attempts)} "
+            f"label={attempt.label} mode={attempt.mode} reasoner={attempt.reasoner}"
+        )
+
+        record: Dict[str, Any] = {
+            "attempt": attempt.index,
+            "label": attempt.label,
+            "mode": attempt.mode,
+            "reasoner": attempt.reasoner,
+            "timeout_seconds": attempt.timeout,
+            "max_tree_lines": settings.max_tree_lines,
+            "max_files": settings.max_files,
+            "max_file_chars": settings.max_file_chars,
+            "max_changes": settings.max_changes,
+            "prompt_path": str(ai_dir / f"{attempt_prefix}-prompt.txt"),
+            "raw_path": str(ai_dir / f"{attempt_prefix}-raw.txt"),
+            "status": "running",
+        }
+
+        try:
+            raw = call_model(parse_model_spec(attempt.reasoner), prompt, cwd=repo, timeout=attempt.timeout)
+            save_model_artifacts(ai_dir, attempt_prefix, prompt, raw)
+            save_model_artifacts(ai_dir, "plan", prompt, raw)
+            plan_md = normalize_model_markdown(raw, "# Repo Review Plan")
+            plan_md = sanitize_plan_commands(plan_md, validation_commands)
+            safe_write(ai_dir / "plan.md", plan_md)
+            record["status"] = "ok"
+            record["plan_path"] = str(ai_dir / "plan.md")
+            attempt_records.append(record)
+            safe_write(ai_dir / "plan-attempts.json", json.dumps(attempt_records, indent=2, ensure_ascii=False))
+            return plan_md, {
+                "attempts": attempt_records,
+                "selected_attempt": attempt.index,
+                "selected_mode": attempt.mode,
+                "selected_reasoner": attempt.reasoner,
+                "reasoner_timeout": attempt.timeout,
+            }
+        except BaseException as exc:
+            last_exc = exc
+            raw_text = ""
+            status = "failed"
+            if isinstance(exc, ExecutionFailure):
+                raw_text = exc.stdout
+                status = exc.status
+            elif isinstance(exc, subprocess.TimeoutExpired):
+                raw_text = to_text(exc.stdout)
+                status = "timeout"
+
+            if raw_text:
+                safe_write(ai_dir / f"{attempt_prefix}-raw.txt", raw_text)
+                safe_write(ai_dir / "plan-raw.txt", raw_text)
+
+            record["status"] = status
+            record["error"] = str(exc)
+            attempt_records.append(record)
+            safe_write(ai_dir / "plan-attempts.json", json.dumps(attempt_records, indent=2, ensure_ascii=False))
+
+            retryable = status == "timeout" and args.plan_retry_on_timeout
+            if retryable and attempt.index < len(attempts):
+                print(f"plan: attempt {attempt.index} timed out; degrading strategy.")
+                continue
+            raise
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("No plan attempts were executed.")
+
+
+# -----------------------------
+# Validation / preflight
+# -----------------------------
+
+def preflight(args, repo: Path) -> None:
+    ensure_git_repo(repo)
+
+    if not command_exists("git"):
+        raise SystemExit("No se encontró 'git' en PATH.")
+
+    if args.cmd in {"plan", "report", "run"} and args.reasoner.strip():
+        if args.cmd in {"plan", "run"}:
+            resolve_plan_settings(args)
+        validate_model_available(parse_model_spec(args.reasoner))
+        if args.cmd in {"plan", "run"} and args.plan_fallback_reasoner.strip():
+            validate_model_available(parse_model_spec(args.plan_fallback_reasoner))
+
+    if args.cmd in {"apply", "run"} and args.aider_model.strip():
+        aider_model = parse_model_spec(args.aider_model)
+        if aider_model.kind != "ollama":
+            raise SystemExit("aider_model debe usar formato ollama:<modelo>.")
+        validate_model_available(aider_model)
+
+    if args.cmd in {"apply", "run"} and not command_exists("aider"):
+        raise SystemExit("No se encontró 'aider' en PATH.")
+
+    if args.cmd in {"plan", "report", "run"}:
+        goals_path = resolve_goals_path(repo, args.goals)
+        if not goals_path.exists():
+            raise SystemExit(f"No existe el archivo de goals: {goals_path}")
+
+    if args.cmd in {"test", "run"}:
+        require_nonempty(args.test_cmd, "test_cmd", "Config: test_cmd: 'pytest -q'")
+        # Validación ligera: si no es shell, comprobar que exista el ejecutable
+        if not looks_like_shell_command(args.test_cmd):
+            first = shlex.split(args.test_cmd)[0]
+            if not command_exists(first):
+                raise SystemExit(f"No se encontró el ejecutable del test_cmd: {first}")
+
+        if args.lint_cmd.strip() and not looks_like_shell_command(args.lint_cmd):
+            first = shlex.split(args.lint_cmd)[0]
+            if not command_exists(first):
+                raise SystemExit(f"No se encontró el ejecutable del lint_cmd: {first}")
+
+    if not args.allow_dirty_repo and args.cmd in {"apply", "run"}:
+        dirty = git_status_porcelain(repo)
+        if dirty:
+            raise SystemExit(
+                "El repo objetivo tiene cambios sin commit.\n"
+                "Haz commit/stash primero o activa --allow-dirty-repo."
+            )
+
+
+# -----------------------------
+# Test report
+# -----------------------------
+
+def write_test_report(
+    repo: Path,
+    ai_dir: Path,
+    lint_cmd: Optional[str],
+    test_cmd: str,
+    lint_required: bool = False,
+    timeout: int = 1800,
+) -> Tuple[bool, str, Dict[str, Any]]:
     """
     Run lint and tests. Save a Markdown report and JSON summary.
     Returns (passed, report_md).
     """
     entries = []
-    summary = {"lint": None, "tests": None, "passed": False, "timestamp": now_stamp()}
+    summary = {
+        "lint": None,
+        "tests": None,
+        "lint_required": lint_required,
+        "passed": False,
+        "timestamp": now_stamp(),
+    }
 
     def run_and_capture(label: str, cmd: str) -> dict:
-        rc, out, err = run_cmd(cmd, cwd=repo, capture=True)
-        return {"label": label, "cmd": cmd, "returncode": rc, "stdout": out, "stderr": err}
+        use_shell = looks_like_shell_command(cmd)
+        try:
+            rc, out, err = run_cmd(cmd, cwd=repo, capture=True, use_shell=use_shell, timeout=timeout)
+            status = "ok" if rc == 0 else "failed"
+            return {
+                "label": label,
+                "cmd": cmd,
+                "returncode": rc,
+                "stdout": out,
+                "stderr": err,
+                "use_shell": use_shell,
+                "status": status,
+                "timeout_seconds": None,
+            }
+        except subprocess.TimeoutExpired as exc:
+            return {
+                "label": label,
+                "cmd": cmd,
+                "returncode": None,
+                "stdout": to_text(exc.stdout),
+                "stderr": to_text(exc.stderr),
+                "use_shell": use_shell,
+                "status": "timeout",
+                "timeout_seconds": timeout,
+            }
 
+    lint_ok = True
     if lint_cmd:
         lint_res = run_and_capture("lint", lint_cmd)
-        summary["lint"] = {"returncode": lint_res["returncode"]}
+        lint_ok = lint_res["returncode"] == 0
+        summary["lint"] = {
+            "returncode": lint_res["returncode"],
+            "status": lint_res["status"],
+            "timeout_seconds": lint_res["timeout_seconds"],
+        }
         entries.append(lint_res)
 
     test_res = run_and_capture("tests", test_cmd)
-    summary["tests"] = {"returncode": test_res["returncode"]}
+    test_ok = test_res["returncode"] == 0
+    summary["tests"] = {
+        "returncode": test_res["returncode"],
+        "status": test_res["status"],
+        "timeout_seconds": test_res["timeout_seconds"],
+    }
     entries.append(test_res)
 
-    passed = (test_res["returncode"] == 0)
+    passed = test_ok and (lint_ok or not lint_required)
     summary["passed"] = passed
+    if any(e["status"] == "timeout" for e in entries):
+        summary["status"] = "timeout"
+    else:
+        summary["status"] = "ok" if passed else "failed"
 
     md_parts = [f"# Test Report\n\nTimestamp: {summary['timestamp']}\n"]
+    md_parts.append(f"- lint_required: **{lint_required}**\n")
+    md_parts.append(f"- overall_passed: **{passed}**\n")
+    md_parts.append(f"- stage_status: **{summary['status']}**\n")
+
     for e in entries:
-        md_parts.append(f"## {e['label'].title()}\n")
+        md_parts.append(f"\n## {e['label'].title()}\n")
         md_parts.append(f"Command:\n```bash\n{e['cmd']}\n```\n")
+        md_parts.append(f"Used shell: **{e['use_shell']}**\n")
+        md_parts.append(f"Status: **{e['status']}**\n")
         md_parts.append(f"Return code: **{e['returncode']}**\n")
+        if e["timeout_seconds"]:
+            md_parts.append(f"Timeout seconds: **{e['timeout_seconds']}**\n")
         md_parts.append("STDOUT:\n```text\n" + truncate(e["stdout"], 15000) + "\n```\n")
         md_parts.append("STDERR:\n```text\n" + truncate(e["stderr"], 15000) + "\n```\n")
 
     report_md = "\n".join(md_parts)
     safe_write(ai_dir / "test-report.md", report_md)
-    safe_write(ai_dir / "test-report.json", json.dumps(summary, indent=2))
+    safe_write(ai_dir / "test-report.json", json.dumps(summary, indent=2, ensure_ascii=False))
 
-    return passed, report_md
+    return passed, report_md, summary
 
 
 # -----------------------------
-# Main CLI
+# Commands
 # -----------------------------
-
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Repo improvement pipeline (reasoner -> aider -> tests -> final report).",
-        formatter_class=argparse.RawTextHelpFormatter
-    )
-    # required=False so `python pipeline.py` can default to run if config exists
-    sub = p.add_subparsers(dest="cmd", required=False)
-
-    def add_common(sp: argparse.ArgumentParser):
-        sp.add_argument("--repo", default=".", help="Path to git repository")
-        sp.add_argument("--config", default="", help="Ruta a config YAML/JSON (default: molde_maestro.yml/.yaml/.json en el repo)")
-        sp.add_argument("--goals", default="PROJECT_GOALS.md", help="Goals markdown file path (relative to repo or absolute)")
-        sp.add_argument("--ai-dir", default="AI", help="Directory to store AI artifacts (relative to repo)")
-        sp.add_argument("--extra-context", action="append", default=[],
-                        help="Additional repo files to include in reasoner context (relative paths). Can be repeated.")
-        sp.add_argument("--max-tree-lines", type=int, default=600, help="Max lines for git ls-files listing in prompts")
-
-    sp_snap = sub.add_parser("snapshot", help="Create a snapshot zip via git archive")
-    add_common(sp_snap)
-    sp_snap.add_argument("--zip", action="store_true", help="Actually create a zip snapshot")
-    sp_snap.add_argument("--ref", default="HEAD", help="Git ref to archive")
-    sp_snap.add_argument("--out", default="", help="Output zip path (default: <repo>/AI/snapshots/<stamp>.zip)")
-
-    sp_plan = sub.add_parser("plan", help="Generate AI/plan.md using the reasoner model")
-    add_common(sp_plan)
-    sp_plan.add_argument("--reasoner", default="", help="Reasoner model spec: ollama:<model> or cmd:<...>")
-    sp_plan.add_argument("--plan-out", default="", help="Output path for plan.md (default: <repo>/<ai-dir>/plan.md)")
-
-    sp_apply = sub.add_parser("apply", help="Create branch and run aider based on AI/plan.md")
-    add_common(sp_apply)
-    sp_apply.add_argument("--aider-model", default="", help="Aider model name (passed to aider --model)")
-    sp_apply.add_argument("--branch", default="", help="Branch name (default: ai/<stamp>-improvements)")
-    sp_apply.add_argument("--base", default="", help="Base branch/ref to branch from (default: current)")
-    sp_apply.add_argument("--allowed-file", action="append", default=[],
-                         help="Restrict aider to these files (repeatable). If omitted, aider can touch anything.")
-    sp_apply.add_argument("--aider-extra-arg", action="append", default=[],
-                         help="Extra args passed to aider (repeatable).")
-
-    sp_test = sub.add_parser("test", help="Run lint/tests and save AI/test-report.*")
-    add_common(sp_test)
-    sp_test.add_argument("--test-cmd", default="", help="Command to run tests (quoted string)")
-    sp_test.add_argument("--lint-cmd", default="", help="Optional lint command")
-
-    sp_report = sub.add_parser("report", help="Generate AI/final.md from goals/plan/test report and git diff")
-    add_common(sp_report)
-    sp_report.add_argument("--reasoner", default="", help="Reasoner model spec: ollama:<model> or cmd:<...>")
-    sp_report.add_argument("--base-ref", default="", help="Base ref for diff (default: merge-base with upstream, else HEAD~1)")
-
-    sp_run = sub.add_parser("run", help="Run full pipeline: snapshot(optional) -> plan -> apply -> test -> report")
-    add_common(sp_run)
-    sp_run.add_argument("--reasoner", default="", help="Reasoner model spec: ollama:<model> or cmd:<...>")
-    sp_run.add_argument("--aider-model", default="", help="Aider model name (passed to aider --model)")
-    sp_run.add_argument("--test-cmd", default="", help="Command to run tests")
-    sp_run.add_argument("--lint-cmd", default="", help="Optional lint command")
-    sp_run.add_argument("--zip", action="store_true", help="Create snapshot zip at start")
-    sp_run.add_argument("--max-iters", type=int, default=2, help="Max iterations if tests fail (re-run aider with errors)")
-    sp_run.add_argument("--branch", default="", help="Branch name (default: ai/<stamp>-improvements)")
-    sp_run.add_argument("--allowed-file", action="append", default=[],
-                        help="Restrict aider to these files (repeatable).")
-    sp_run.add_argument("--aider-extra-arg", action="append", default=[],
-                        help="Extra args passed to aider (repeatable).")
-
-    return p
-
-
-def resolve_goals_path(repo: Path, goals_arg: str) -> Path:
-    gp = Path(goals_arg)
-    if gp.is_absolute():
-        return gp
-    return repo / gp
-
-
-def ensure_ai_dir(repo: Path, ai_dir_name: str) -> Path:
-    p = repo / ai_dir_name
-    p.mkdir(parents=True, exist_ok=True)
-    return p
-
-
-def require_nonempty(val: str, name: str, hint: str = "") -> None:
-    if not val or not val.strip():
-        msg = f"Falta '{name}'."
-        if hint:
-            msg += f" {hint}"
-        raise SystemExit(msg)
-
 
 def cmd_snapshot(args) -> None:
-    repo = Path(args.repo).expanduser().resolve()
-    ensure_git_repo(repo)
-    ai_dir = ensure_ai_dir(repo, args.ai_dir)
+    repo, ai_dir, recorder = init_run_context(args)
+    preflight(args, repo)
 
     if not args.zip:
         print("snapshot: --zip no está activado; no se creó zip.")
+        recorder.mark_stage_skipped("snapshot", "zip_disabled")
+        recorder.complete_run("ok", {"snapshot_created": False})
         return
 
-    out_zip = Path(args.out).expanduser()
-    if not args.out:
-        out_zip = ai_dir / "snapshots" / f"{now_stamp()}.zip"
-    elif not out_zip.is_absolute():
-        out_zip = repo / out_zip
+    with record_stage(recorder, "snapshot") as details:
+        out_zip = Path(args.out).expanduser() if args.out else ai_dir / "snapshots" / f"{now_stamp()}.zip"
+        if not out_zip.is_absolute():
+            out_zip = repo / out_zip
 
-    git_archive_zip(repo, out_zip, ref=args.ref)
-    print(f"snapshot: wrote {out_zip}")
+        git_archive_zip(repo, out_zip, ref=args.ref)
+        details["artifact"] = str(out_zip)
+        print(f"snapshot: wrote {out_zip}")
+    recorder.complete_run("ok", {"snapshot_created": True})
 
 
 def cmd_plan(args) -> None:
-    repo = Path(args.repo).expanduser().resolve()
-    ensure_git_repo(repo)
-    ai_dir = ensure_ai_dir(repo, args.ai_dir)
+    repo, ai_dir, recorder = init_run_context(args)
+    preflight(args, repo)
 
-    require_nonempty(args.reasoner, "reasoner", "Config: reasoner: 'ollama:deepseek-r1' (por ejemplo).")
-
+    require_nonempty(args.reasoner, "reasoner", "Config: reasoner: 'ollama:deepseek-r1'")
     goals_path = resolve_goals_path(repo, args.goals)
     goals_text = read_text(goals_path, default="# PROJECT_GOALS.md\n\n[Missing goals file]\n")
 
     reasoner = parse_model_spec(args.reasoner)
-
-    prompt = build_reasoner_prompt(
-        repo=repo,
-        goals_text=goals_text,
-        extra_context_files=args.extra_context,
-        max_tree_lines=args.max_tree_lines
-    )
-    plan_md = call_model(reasoner, prompt, cwd=repo)
-    if not plan_md.strip().startswith("#"):
-        plan_md = "# Repo Review Plan\n\n" + plan_md
-
-    plan_out = Path(args.plan_out).expanduser()
-    if not args.plan_out:
-        plan_out = ai_dir / "plan.md"
-    elif not plan_out.is_absolute():
+    plan_out = Path(args.plan_out).expanduser() if args.plan_out else ai_dir / "plan.md"
+    if not plan_out.is_absolute():
         plan_out = repo / plan_out
 
-    safe_write(plan_out, plan_md)
-    print(f"plan: wrote {plan_out}")
-
-
-def git_current_branch(repo: Path) -> str:
-    _, out, _ = run_cmd("git rev-parse --abbrev-ref HEAD", cwd=repo, check=True)
-    return out.strip()
-
-
-def git_create_branch(repo: Path, branch_name: str) -> None:
-    run_cmd(f"git checkout -b {shlex.quote(branch_name)}", cwd=repo, check=True)
-
-
-def git_checkout(repo: Path, branch: str) -> None:
-    run_cmd(f"git checkout {shlex.quote(branch)}", cwd=repo, check=True)
-
-
-def git_status_porcelain(repo: Path) -> str:
-    _, out, _ = run_cmd("git status --porcelain", cwd=repo)
-    return out.strip()
+    try:
+        with record_stage(recorder, "plan") as details:
+            plan_md, plan_meta = run_plan_generation(repo, ai_dir, goals_text, args)
+            if plan_out != ai_dir / "plan.md":
+                safe_write(plan_out, plan_md)
+            details["artifact"] = str(plan_out)
+            details["prompt_path"] = str(ai_dir / "plan-prompt.txt")
+            details["raw_path"] = str(ai_dir / "plan-raw.txt")
+            details["sanitized_path"] = str(plan_out)
+            details.update(plan_meta)
+            print(f"plan: wrote {plan_out}")
+    except BaseException as exc:
+        error_path = write_stage_error(
+            ai_dir,
+            "plan",
+            exc,
+            {
+                "reasoner_timeout": args.reasoner_timeout,
+                "plan_mode": args.plan_mode,
+                "plan_fallback_reasoner": args.plan_fallback_reasoner,
+                "plan_fallback_timeout": effective_plan_fallback_timeout(args),
+                "plan_attempts_path": str(ai_dir / "plan-attempts.json"),
+            },
+        )
+        recorder.fail_run(str(exc), "timeout" if isinstance(exc, ExecutionFailure) and exc.status == "timeout" else "failed", {"stage": "plan", "error_path": str(error_path)})
+        print(f"plan: failed. See {error_path}")
+        raise
+    recorder.complete_run("ok", {"plan_path": str(plan_out)})
 
 
 def cmd_apply(args) -> None:
-    repo = Path(args.repo).expanduser().resolve()
-    ensure_git_repo(repo)
-    ai_dir = ensure_ai_dir(repo, args.ai_dir)
+    repo, ai_dir, recorder = init_run_context(args)
+    preflight(args, repo)
 
-    require_nonempty(args.aider_model, "aider_model", "Config: aider_model: 'ollama:qwen3-coder:14b' (por ejemplo).")
-
-    base = args.base.strip() or git_current_branch(repo)
-    branch = args.branch.strip() or f"ai/{now_stamp()}-improvements"
-
-    git_checkout(repo, base)
-    git_create_branch(repo, branch)
+    require_nonempty(args.aider_model, "aider_model", "Config: aider_model: 'ollama:qwen3-coder:14b'")
 
     plan_path = ai_dir / "plan.md"
     plan_text = read_text(plan_path, default="")
     if not plan_text.strip():
         raise SystemExit(f"apply: falta o está vacío {plan_path}. Ejecuta `plan` primero.")
 
-    aider_msg = default_aider_instruction(plan_text)
-    log_path = ai_dir / "aider-log.txt"
+    try:
+        with record_stage(recorder, "apply") as details:
+            clear_artifacts(ai_dir, ["aider-log.txt", "aider-message.txt", "apply-error.md", "apply-scope.json", "apply-selected-plan.md"])
+            base = resolve_base_branch(repo, args.base)
+            branch = args.branch.strip() or f"ai/{now_stamp()}-improvements"
+            git_checkout(repo, base)
+            git_create_branch(repo, branch)
+            pre_apply_head = git_head_commit(repo)
 
-    rc, _, err = run_aider(
-        repo=repo,
-        aider_model=args.aider_model,
-        message=aider_msg,
-        files=args.allowed_file if args.allowed_file else None,
-        log_path=log_path,
-        extra_args=args.aider_extra_arg,
-    )
-    print(f"apply: aider return code = {rc}")
-    if rc != 0:
-        print("apply: aider stderr (truncated):")
-        print(truncate(err, 4000))
-        raise SystemExit(rc)
+            ensure_repo_ready_for_aider(repo)
 
-    dirty = git_status_porcelain(repo)
-    if dirty:
-        print("apply: repo tiene cambios sin commit (aider debería haber auto-commiteado).")
-        print(dirty)
+            apply_scope = resolve_apply_scope(repo, plan_text, args)
+            validation_commands = detect_validation_commands(repo, args)
+            aider_msg = default_aider_instruction(
+                plan_text,
+                selected_plan_md=apply_scope.selected_plan_md,
+                allowed_files=apply_scope.selected_files,
+                validation_commands=validation_commands,
+                plan_mode=args.plan_mode,
+            )
+            safe_write(ai_dir / "aider-message.txt", aider_msg)
+            safe_write(ai_dir / "apply-selected-plan.md", apply_scope.selected_plan_md or "[No selected plan subset]\n")
+            safe_write(
+                ai_dir / "apply-scope.json",
+                json.dumps(
+                    {
+                        "source": apply_scope.source,
+                        "max_changes": apply_scope.max_changes,
+                        "selected_files": apply_scope.selected_files,
+                        "selected_change_titles": [change.title for change in apply_scope.selected_changes],
+                        "skipped_change_titles": apply_scope.skipped_change_titles,
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+            )
+            log_path = ai_dir / "aider-log.txt"
+
+            rc, stdout, err = run_aider(
+                repo=repo,
+                aider_model=args.aider_model,
+                message=aider_msg,
+                files=apply_scope.selected_files or None,
+                log_path=log_path,
+                extra_args=args.aider_extra_arg,
+                timeout=args.aider_timeout,
+            )
+            details["base"] = base
+            details["branch"] = branch
+            details["log_path"] = str(log_path)
+            details["aider_timeout"] = args.aider_timeout
+            details["apply_scope_path"] = str(ai_dir / "apply-scope.json")
+            details["selected_plan_path"] = str(ai_dir / "apply-selected-plan.md")
+            details["apply_scope_source"] = apply_scope.source
+            details["selected_files"] = apply_scope.selected_files
+            details["selected_change_titles"] = [change.title for change in apply_scope.selected_changes]
+            details["skipped_change_titles"] = apply_scope.skipped_change_titles
+            details["stdout_excerpt"] = truncate(stdout, 2000)
+            if rc != 0 or aider_output_has_fatal_error(stdout, err):
+                raise ExecutionFailure(
+                    f"Aider failed ({rc}).",
+                    command=f"aider --model {normalize_aider_model_name(args.aider_model)}",
+                    returncode=rc,
+                    stdout=stdout,
+                    stderr=err,
+                    status="failed",
+                )
+            post_apply_head = git_head_commit(repo)
+            changed_files = git_changed_files_between(repo, pre_apply_head, post_apply_head)
+            if post_apply_head == pre_apply_head or not changed_files or set(changed_files) <= {".gitignore"}:
+                raise ExecutionFailure(
+                    "Aider completed without producing a meaningful committed change.",
+                    command=f"aider --model {normalize_aider_model_name(args.aider_model)}",
+                    stdout=stdout,
+                    stderr=err,
+                    status="failed",
+                )
+            if args.apply_enforce_plan_scope and apply_scope.selected_files:
+                scope_violations = [
+                    path for path in changed_files if path not in apply_scope.selected_files and path != ".gitignore"
+                ]
+                if scope_violations:
+                    raise ExecutionFailure(
+                        "Aider changed files outside the selected apply scope.",
+                        command=f"aider --model {normalize_aider_model_name(args.aider_model)}",
+                        stdout=stdout,
+                        stderr=err,
+                        status="failed",
+                    )
+            dep_audit = audit_python_dependency_declarations(repo, changed_files)
+            details["dependency_audit"] = dep_audit
+            if not dep_audit["ok"]:
+                raise ExecutionFailure(
+                    "Aider introduced Python imports whose dependencies are not declared in the repo.",
+                    command=f"aider --model {normalize_aider_model_name(args.aider_model)}",
+                    stdout=stdout,
+                    stderr=json.dumps(dep_audit, ensure_ascii=False),
+                    status="failed",
+                )
+            details["changed_files"] = changed_files
+            print(f"apply: aider return code = {rc}")
+
+            dirty = git_status_porcelain(repo)
+            details["dirty_after_apply"] = bool(dirty)
+            if dirty:
+                print("apply: el repo tiene cambios sin commit. Revisa si Aider dejó algo sin auto-commit.")
+                print(dirty)
+    except BaseException as exc:
+        error_path = write_stage_error(ai_dir, "apply", exc, {"aider_timeout": args.aider_timeout})
+        recorder.fail_run(str(exc), "timeout" if isinstance(exc, ExecutionFailure) and exc.status == "timeout" else "failed", {"stage": "apply", "error_path": str(error_path)})
+        print(f"apply: failed. See {error_path}")
+        raise
+    recorder.complete_run("ok", {"plan_path": str(plan_path)})
 
 
 def cmd_test(args) -> None:
-    repo = Path(args.repo).expanduser().resolve()
-    ensure_git_repo(repo)
-    ai_dir = ensure_ai_dir(repo, args.ai_dir)
-
-    require_nonempty(args.test_cmd, "test_cmd", "Config: test_cmd: 'pytest -q' (por ejemplo).")
+    repo, ai_dir, recorder = init_run_context(args)
+    preflight(args, repo)
 
     lint_cmd = args.lint_cmd.strip() or None
-    passed, _ = write_test_report(repo, ai_dir, lint_cmd, args.test_cmd)
-    print(f"test: passed={passed} (report in {ai_dir / 'test-report.md'})")
+    try:
+        with record_stage(recorder, "test") as details:
+            clear_artifacts(ai_dir, ["test-report.md", "test-report.json", "test-error.md"])
+            passed, _, summary = write_test_report(
+                repo,
+                ai_dir,
+                lint_cmd,
+                args.test_cmd,
+                lint_required=args.lint_required,
+                timeout=args.test_timeout,
+            )
+            details["__status"] = summary["status"]
+            details["artifact"] = str(ai_dir / "test-report.md")
+            details["test_timeout"] = args.test_timeout
+            details["summary"] = summary
+            print(f"test: passed={passed} (report in {ai_dir / 'test-report.md'})")
+    except BaseException as exc:
+        error_path = write_stage_error(ai_dir, "test", exc, {"test_timeout": args.test_timeout})
+        recorder.fail_run(str(exc), "timeout" if isinstance(exc, ExecutionFailure) and exc.status == "timeout" else "failed", {"stage": "test", "error_path": str(error_path)})
+        print(f"test: failed. See {error_path}")
+        raise
+    recorder.complete_run(summary["status"], {"passed": passed, "test_report": str(ai_dir / "test-report.md")})
     if not passed:
-        raise SystemExit(2)
-
-
-def infer_base_ref(repo: Path) -> str:
-    """
-    Infer a base ref for diffs:
-    - Prefer merge-base with upstream if exists.
-    - Else fallback to HEAD~1.
-    """
-    code, out, _ = run_cmd("git rev-parse --abbrev-ref --symbolic-full-name @{u}", cwd=repo)
-    if code == 0:
-        upstream = out.strip()
-        code2, out2, _ = run_cmd(f"git merge-base HEAD {shlex.quote(upstream)}", cwd=repo)
-        if code2 == 0 and out2.strip():
-            return out2.strip()
-    return "HEAD~1"
+        raise SystemExit(124 if summary["status"] == "timeout" else 2)
 
 
 def cmd_report(args) -> None:
-    repo = Path(args.repo).expanduser().resolve()
-    ensure_git_repo(repo)
-    ai_dir = ensure_ai_dir(repo, args.ai_dir)
+    repo, ai_dir, recorder = init_run_context(args)
+    preflight(args, repo)
 
-    require_nonempty(args.reasoner, "reasoner", "Config: reasoner: 'ollama:deepseek-r1' (por ejemplo).")
+    require_nonempty(args.reasoner, "reasoner", "Config: reasoner: 'ollama:deepseek-r1'")
 
     goals_path = resolve_goals_path(repo, args.goals)
     goals_text = read_text(goals_path, default="# PROJECT_GOALS.md\n\n[Missing goals file]\n")
 
     plan_text = read_text(ai_dir / "plan.md", default="")
     test_report_md = read_text(ai_dir / "test-report.md", default="[Missing test report]")
+    run_metadata = read_text(ai_dir / "run-metadata.json", default="[Missing run metadata]")
     if not plan_text.strip():
         raise SystemExit("report: falta AI/plan.md")
 
     reasoner = parse_model_spec(args.reasoner)
+    try:
+        with record_stage(recorder, "report") as details:
+            clear_artifacts(ai_dir, ["final.md", "report-prompt.txt", "report-raw.txt", "report-model.md", "report-error.md"])
+            base_ref = args.base_ref.strip() or infer_base_ref(repo)
+            git_diff = collect_git_diff(repo, base_ref)
+            changed_files = collect_git_changed_files(repo, base_ref)
 
-    base_ref = args.base_ref.strip() or infer_base_ref(repo)
-    git_diff = collect_git_diff(repo, base_ref)
+            prompt = build_report_prompt(goals_text, plan_text, test_report_md, git_diff, run_metadata)
+            save_model_artifacts(ai_dir, "report", prompt)
+            raw = call_model(reasoner, prompt, cwd=repo, timeout=effective_report_timeout(args))
+            save_model_artifacts(ai_dir, "report", prompt, raw)
+            metadata_payload = json.loads(run_metadata) if run_metadata.strip().startswith("{") else recorder.metadata
+            final_md = build_grounded_final_report(
+                project_reported_metadata(metadata_payload, metadata_payload.get("status")),
+                plan_text,
+                test_report_md,
+                changed_files,
+                git_diff,
+            )
+            safe_write(ai_dir / "report-model.md", normalize_model_markdown(raw, "# Final Report"))
 
-    prompt = build_report_prompt(goals_text, plan_text, test_report_md, git_diff)
-    final_md = call_model(reasoner, prompt, cwd=repo)
-    if not final_md.strip().startswith("#"):
-        final_md = "# Final Report\n\n" + final_md
-
-    safe_write(ai_dir / "final.md", final_md)
-    print(f"report: wrote {ai_dir / 'final.md'} (base_ref={base_ref})")
+            safe_write(ai_dir / "final.md", final_md)
+            details["artifact"] = str(ai_dir / "final.md")
+            details["base_ref"] = base_ref
+            details["prompt_path"] = str(ai_dir / "report-prompt.txt")
+            details["raw_path"] = str(ai_dir / "report-raw.txt")
+            details["model_report_path"] = str(ai_dir / "report-model.md")
+            details["report_timeout"] = effective_report_timeout(args)
+            print(f"report: wrote {ai_dir / 'final.md'} (base_ref={base_ref})")
+    except BaseException as exc:
+        error_path = write_stage_error(ai_dir, "report", exc, {"report_timeout": effective_report_timeout(args)})
+        recorder.fail_run(str(exc), "timeout" if isinstance(exc, ExecutionFailure) and exc.status == "timeout" else "failed", {"stage": "report", "error_path": str(error_path)})
+        print(f"report: failed. See {error_path}")
+        raise
+    recorder.complete_run("ok", {"final_report": str(ai_dir / "final.md")})
 
 
 def cmd_run(args) -> None:
-    repo = Path(args.repo).expanduser().resolve()
-    ensure_git_repo(repo)
-    ai_dir = ensure_ai_dir(repo, args.ai_dir)
+    repo, ai_dir, recorder = init_run_context(args)
+    preflight(args, repo)
 
-    require_nonempty(args.reasoner, "reasoner", "Config: reasoner: 'ollama:deepseek-r1' (por ejemplo).")
-    require_nonempty(args.aider_model, "aider_model", "Config: aider_model: 'ollama:qwen3-coder:14b' (por ejemplo).")
-    require_nonempty(args.test_cmd, "test_cmd", "Config: test_cmd: 'pytest -q' (por ejemplo).")
+    require_nonempty(args.reasoner, "reasoner", "Config: reasoner: 'ollama:deepseek-r1'")
+    require_nonempty(args.aider_model, "aider_model", "Config: aider_model: 'ollama:qwen3-coder:14b'")
+    require_nonempty(args.test_cmd, "test_cmd", "Config: test_cmd: 'pytest -q'")
+    reasoner = parse_model_spec(args.reasoner)
 
     if args.zip:
-        out_zip = ai_dir / "snapshots" / f"{now_stamp()}.zip"
-        git_archive_zip(repo, out_zip)
-        print(f"run: snapshot zip -> {out_zip}")
+        with record_stage(recorder, "snapshot") as details:
+            out_zip = ai_dir / "snapshots" / f"{now_stamp()}.zip"
+            git_archive_zip(repo, out_zip)
+            details["artifact"] = str(out_zip)
+            print(f"run: snapshot zip -> {out_zip}")
+    else:
+        recorder.mark_stage_skipped("snapshot", "zip_disabled")
 
     goals_path = resolve_goals_path(repo, args.goals)
     goals_text = read_text(goals_path, default="# PROJECT_GOALS.md\n\n[Missing goals file]\n")
-    reasoner = parse_model_spec(args.reasoner)
+    try:
+        with record_stage(recorder, "plan") as details:
+            plan_md, plan_meta = run_plan_generation(repo, ai_dir, goals_text, args)
+            details["artifact"] = str(ai_dir / "plan.md")
+            details["prompt_path"] = str(ai_dir / "plan-prompt.txt")
+            details["raw_path"] = str(ai_dir / "plan-raw.txt")
+            details.update(plan_meta)
+            print(f"run: plan -> {ai_dir / 'plan.md'}")
 
-    plan_prompt = build_reasoner_prompt(
-        repo=repo,
-        goals_text=goals_text,
-        extra_context_files=args.extra_context,
-        max_tree_lines=args.max_tree_lines
-    )
-    plan_md = call_model(reasoner, plan_prompt, cwd=repo)
-    if not plan_md.strip().startswith("#"):
-        plan_md = "# Repo Review Plan\n\n" + plan_md
-    safe_write(ai_dir / "plan.md", plan_md)
-    print(f"run: plan -> {ai_dir / 'plan.md'}")
+        lint_cmd = args.lint_cmd.strip() or None
+        test_cmd = args.test_cmd
+        last_feedback = ""
+        final_passed = False
+        test_summary: Dict[str, Any] = {"status": "failed"}
 
-    base = git_current_branch(repo)
-    branch = args.branch.strip() or f"ai/{now_stamp()}-improvements"
-    git_checkout(repo, base)
-    git_create_branch(repo, branch)
-    print(f"run: branch -> {branch} (from {base})")
+        with record_stage(recorder, "apply") as details:
+            clear_artifacts(ai_dir, ["aider-log.txt", "aider-message.txt", "apply-error.md", "apply-scope.json", "apply-selected-plan.md", "test-report.md", "test-report.json", "test-error.md", "final.md", "report-prompt.txt", "report-raw.txt", "report-model.md", "report-error.md"])
+            base = resolve_base_branch(repo, args.base)
+            branch = args.branch.strip() or f"ai/{now_stamp()}-improvements"
+            git_checkout(repo, base)
+            git_create_branch(repo, branch)
+            print(f"run: branch -> {branch} (from {base})")
+            pre_apply_head = git_head_commit(repo)
 
-    aider_log = ai_dir / "aider-log.txt"
-    aider_msg = default_aider_instruction(plan_md)
+            ensure_repo_ready_for_aider(repo)
 
-    lint_cmd = args.lint_cmd.strip() or None
-    test_cmd = args.test_cmd
+            aider_log = ai_dir / "aider-log.txt"
+            apply_scope = resolve_apply_scope(repo, plan_md, args)
+            validation_commands = detect_validation_commands(repo, args)
+            aider_msg = default_aider_instruction(
+                plan_md,
+                selected_plan_md=apply_scope.selected_plan_md,
+                allowed_files=apply_scope.selected_files,
+                validation_commands=validation_commands,
+                plan_mode=args.plan_mode,
+            )
+            safe_write(ai_dir / "apply-selected-plan.md", apply_scope.selected_plan_md or "[No selected plan subset]\n")
+            safe_write(
+                ai_dir / "apply-scope.json",
+                json.dumps(
+                    {
+                        "source": apply_scope.source,
+                        "max_changes": apply_scope.max_changes,
+                        "selected_files": apply_scope.selected_files,
+                        "selected_change_titles": [change.title for change in apply_scope.selected_changes],
+                        "skipped_change_titles": apply_scope.skipped_change_titles,
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+            )
+            details["base"] = base
+            details["branch"] = branch
+            details["log_path"] = str(aider_log)
+            details["aider_timeout"] = args.aider_timeout
+            details["apply_scope_path"] = str(ai_dir / "apply-scope.json")
+            details["selected_plan_path"] = str(ai_dir / "apply-selected-plan.md")
+            details["apply_scope_source"] = apply_scope.source
+            details["selected_files"] = apply_scope.selected_files
+            details["selected_change_titles"] = [change.title for change in apply_scope.selected_changes]
+            details["skipped_change_titles"] = apply_scope.skipped_change_titles
 
-    last_feedback = ""
-    for i in range(1, args.max_iters + 1):
-        msg = aider_msg if i == 1 else (aider_msg + "\n\nAlso fix the following test/lint failures:\n" + truncate(last_feedback, 12000))
+            for i in range(1, args.max_iters + 1):
+                msg = aider_msg if i == 1 else (
+                    aider_msg
+                    + "\n\nAlso fix the following test/lint failures:\n"
+                    + truncate(last_feedback, 12000)
+                )
+                safe_write(ai_dir / "aider-message.txt", msg)
+                rc, stdout, err = run_aider(
+                    repo=repo,
+                    aider_model=args.aider_model,
+                    message=msg,
+                    files=apply_scope.selected_files or None,
+                    log_path=aider_log,
+                    extra_args=args.aider_extra_arg,
+                    timeout=args.aider_timeout,
+                )
+                if rc != 0 or aider_output_has_fatal_error(stdout, err):
+                    raise ExecutionFailure(
+                        f"Aider failed on iteration {i} ({rc}).",
+                        command=f"aider --model {normalize_aider_model_name(args.aider_model)}",
+                        returncode=rc,
+                        stdout=stdout,
+                        stderr=err,
+                        status="failed",
+                    )
+                post_apply_head = git_head_commit(repo)
+                changed_files = git_changed_files_between(repo, pre_apply_head, post_apply_head)
+                if post_apply_head == pre_apply_head or not changed_files or set(changed_files) <= {".gitignore"}:
+                    raise ExecutionFailure(
+                        "Aider completed without producing a meaningful committed change.",
+                        command=f"aider --model {normalize_aider_model_name(args.aider_model)}",
+                        stdout=stdout,
+                        stderr=err,
+                        status="failed",
+                    )
+                if args.apply_enforce_plan_scope and apply_scope.selected_files:
+                    scope_violations = [
+                        path for path in changed_files if path not in apply_scope.selected_files and path != ".gitignore"
+                    ]
+                    if scope_violations:
+                        raise ExecutionFailure(
+                            "Aider changed files outside the selected apply scope.",
+                            command=f"aider --model {normalize_aider_model_name(args.aider_model)}",
+                            stdout=stdout,
+                            stderr=err,
+                            status="failed",
+                        )
+                dep_audit = audit_python_dependency_declarations(repo, changed_files)
+                details["dependency_audit"] = dep_audit
+                if not dep_audit["ok"]:
+                    raise ExecutionFailure(
+                        "Aider introduced Python imports whose dependencies are not declared in the repo.",
+                        command=f"aider --model {normalize_aider_model_name(args.aider_model)}",
+                        stdout=stdout,
+                        stderr=json.dumps(dep_audit, ensure_ascii=False),
+                        status="failed",
+                    )
+                details["last_iteration"] = i
+                details["stdout_excerpt"] = truncate(stdout, 2000)
+                details["changed_files"] = changed_files
 
-        rc, _, err = run_aider(
-            repo=repo,
-            aider_model=args.aider_model,
-            message=msg,
-            files=args.allowed_file if args.allowed_file else None,
-            log_path=aider_log,
-            extra_args=args.aider_extra_arg,
+                with record_stage(recorder, "test") as test_details:
+                    clear_artifacts(ai_dir, ["test-report.md", "test-report.json", "test-error.md"])
+                    passed, test_report_md, test_summary = write_test_report(
+                        repo,
+                        ai_dir,
+                        lint_cmd,
+                        test_cmd,
+                        lint_required=args.lint_required,
+                        timeout=args.test_timeout,
+                    )
+                    test_details["__status"] = test_summary["status"]
+                    test_details["artifact"] = str(ai_dir / "test-report.md")
+                    test_details["iteration"] = i
+                    test_details["test_timeout"] = args.test_timeout
+                    test_details["summary"] = test_summary
+                    print(f"run: iter {i} tests passed={passed}")
+                if passed:
+                    final_passed = True
+                    break
+
+                last_feedback = test_report_md
+
+        if not (ai_dir / "test-report.md").exists():
+            safe_write(ai_dir / "test-report.md", "[No test report produced]\n")
+            recorder.mark_stage_skipped("test", "no_test_report_produced")
+
+        if not final_passed:
+            print("run: se agotaron las iteraciones sin conseguir un estado verde completo.")
+
+        with record_stage(recorder, "report") as details:
+            clear_artifacts(ai_dir, ["final.md", "report-prompt.txt", "report-raw.txt", "report-model.md", "report-error.md"])
+            base_ref = infer_base_ref(repo)
+            git_diff = collect_git_diff(repo, base_ref)
+            changed_files = collect_git_changed_files(repo, base_ref)
+            report_prompt = build_report_prompt(
+                goals_text,
+                plan_md,
+                read_text(ai_dir / "test-report.md"),
+                git_diff,
+                read_text(ai_dir / "run-metadata.json"),
+            )
+            save_model_artifacts(ai_dir, "report", report_prompt)
+            report_raw = call_model(reasoner, report_prompt, cwd=repo, timeout=effective_report_timeout(args))
+            save_model_artifacts(ai_dir, "report", report_prompt, report_raw)
+            safe_write(ai_dir / "report-model.md", normalize_model_markdown(report_raw, "# Final Report"))
+            projected_status = "ok" if final_passed else test_summary.get("status", "failed")
+            final_md = build_grounded_final_report(
+                project_reported_metadata(recorder.metadata, projected_status),
+                plan_md,
+                read_text(ai_dir / "test-report.md"),
+                changed_files,
+                git_diff,
+            )
+            safe_write(ai_dir / "final.md", final_md)
+            details["artifact"] = str(ai_dir / "final.md")
+            details["base_ref"] = base_ref
+            details["prompt_path"] = str(ai_dir / "report-prompt.txt")
+            details["raw_path"] = str(ai_dir / "report-raw.txt")
+            details["model_report_path"] = str(ai_dir / "report-model.md")
+            details["report_timeout"] = effective_report_timeout(args)
+            print(f"run: final -> {ai_dir / 'final.md'} (base_ref={base_ref})")
+    except BaseException as exc:
+        failed_stage = next((stage["name"] for stage in reversed(recorder.metadata["stages"]) if stage["status"] in {"running", "failed", "timeout"}), "run")
+        error_path = write_stage_error(ai_dir, failed_stage, exc)
+        status = "timeout" if isinstance(exc, ExecutionFailure) and exc.status == "timeout" else "failed"
+        recorder.fail_run(str(exc), status, {"stage": failed_stage, "error_path": str(error_path)})
+        final_md = build_fallback_final_report(
+            recorder.metadata,
+            read_text(ai_dir / "plan.md"),
+            read_text(ai_dir / "test-report.md"),
         )
-        if rc != 0:
-            print(f"run: aider failed (iter {i}) rc={rc}")
-            print(truncate(err, 4000))
-            raise SystemExit(rc)
+        safe_write(ai_dir / "final.md", final_md)
+        print(f"run: failed during {failed_stage}. See {error_path}")
+        raise
 
-        passed, test_report_md = write_test_report(repo, ai_dir, lint_cmd, test_cmd)
-        print(f"run: iter {i} tests passed={passed}")
-        if passed:
-            break
+    final_status = "ok" if final_passed else test_summary.get("status", "failed")
+    recorder.complete_run(final_status, {"tests_passed": final_passed, "test_status": test_summary.get("status", "failed")})
 
-        last_feedback = test_report_md
 
-    if not (ai_dir / "test-report.md").exists():
-        safe_write(ai_dir / "test-report.md", "[No test report produced]\n")
+# -----------------------------
+# CLI
+# -----------------------------
 
-    base_ref = infer_base_ref(repo)
-    git_diff = collect_git_diff(repo, base_ref)
-    report_prompt = build_report_prompt(goals_text, plan_md, read_text(ai_dir / "test-report.md"), git_diff)
-    final_md = call_model(reasoner, report_prompt, cwd=repo)
-    if not final_md.strip().startswith("#"):
-        final_md = "# Final Report\n\n" + final_md
-    safe_write(ai_dir / "final.md", final_md)
-    print(f"run: final -> {ai_dir / 'final.md'} (base_ref={base_ref})")
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Repo improvement pipeline (reasoner -> aider -> tests -> final report).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
 
+    p.add_argument("--config", default="", help="Ruta al config YAML/JSON.")
+    sub = p.add_subparsers(dest="cmd")
+
+    def add_shared(sp):
+        sp.add_argument("--repo", default=".", help="Ruta del repo objetivo.")
+        sp.add_argument("--goals", default="PROJECT_GOALS.md", help="Archivo de objetivos.")
+        sp.add_argument("--ai-dir", default="AI", help="Directorio de artefactos AI.")
+        sp.add_argument("--reasoner", default="", help="Modelo reasoner. Ej: ollama:deepseek-r1")
+        sp.add_argument("--plan-mode", default="balanced", help="Estrategia de planning: fast, balanced o deep.")
+        sp.add_argument("--plan-max-tree-lines", type=int, default=0, help="Override del máximo de líneas del árbol enviadas al reasoner.")
+        sp.add_argument("--plan-max-files", type=int, default=0, help="Override del máximo de archivos incluidos en el contexto de planning.")
+        sp.add_argument("--plan-max-file-chars", type=int, default=0, help="Override del máximo de caracteres por archivo en planning.")
+        sp.add_argument("--plan-max-changes", type=int, default=0, help="Override del máximo de cambios que debe proponer el plan.")
+        sp.add_argument("--plan-fallback-reasoner", default="", help="Modelo alternativo para planning si el principal entra en timeout.")
+        sp.add_argument("--plan-fallback-timeout", type=int, default=0, help="Timeout del fallback de planning. Si es 0, usa reasoner-timeout.")
+        sp.add_argument("--plan-retry-on-timeout", action="store_true", help="Si se activa, reintenta planning con modo fast y/o fallback al hacer timeout.")
+        sp.add_argument("--apply-max-plan-changes", type=int, default=0, help="Máximo de cambios del plan a implementar. Si es 0, usa modo automático por plan-mode.")
+        sp.add_argument("--apply-limit-to-plan-files", action="store_true", help="Limita Aider a los archivos explícitamente listados en el plan o en --allowed-file.")
+        sp.add_argument("--apply-enforce-plan-scope", action="store_true", help="Falla si Aider modifica archivos fuera del scope seleccionado.")
+        sp.add_argument("--apply-skip-unsupported-plan-changes", action="store_true", help="Omite cambios del plan que parecen requerir archivos o dependencias no presentes en el repo.")
+        sp.add_argument("--aider-model", default="", help="Modelo para Aider. Ej: ollama:qwen3-coder:14b")
+        sp.add_argument("--reasoner-timeout", type=int, default=1800, help="Timeout en segundos para el reasoner del plan.")
+        sp.add_argument("--report-timeout", type=int, default=0, help="Timeout en segundos para el reporte final. Si es 0, usa reasoner-timeout.")
+        sp.add_argument("--aider-timeout", type=int, default=7200, help="Timeout en segundos para Aider.")
+        sp.add_argument("--test-timeout", type=int, default=1800, help="Timeout en segundos para lint/tests.")
+        sp.add_argument("--test-cmd", default="", help="Comando de tests.")
+        sp.add_argument("--lint-cmd", default="", help="Comando de lint.")
+        sp.add_argument("--lint-required", action="store_true", help="Si se activa, lint también bloquea el pipeline.")
+        sp.add_argument("--allow-dirty-repo", action="store_true", help="Permite correr sobre un repo con cambios sin commit.")
+        sp.add_argument("--max-iters", type=int, default=2, help="Máximo de iteraciones Aider->tests.")
+        sp.add_argument("--zip", action="store_true", help="Crear snapshot zip.")
+        sp.add_argument("--branch", default="", help="Nombre de la rama a crear.")
+        sp.add_argument("--base", default="", help="Rama/ref base para apply/run.")
+        sp.add_argument("--base-ref", default="", help="Base ref para report/diff.")
+        sp.add_argument("--allowed-file", action="append", default=[], help="Archivo permitido para Aider (repetible).")
+        sp.add_argument("--aider-extra-arg", action="append", default=[], help="Argumento extra para Aider (repetible).")
+        sp.add_argument("--extra-context", action="append", default=[], help="Archivo adicional de contexto para el plan.")
+        sp.add_argument("--max-tree-lines", type=int, default=600, help="Máximo de líneas del árbol del repo.")
+
+    sp_snapshot = sub.add_parser("snapshot", help="Crear snapshot zip del repo.")
+    add_shared(sp_snapshot)
+    sp_snapshot.add_argument("--ref", default="HEAD", help="Git ref a archivar.")
+    sp_snapshot.add_argument("--out", default="", help="Ruta de salida para el zip.")
+
+    sp_plan = sub.add_parser("plan", help="Generar AI/plan.md con el reasoner.")
+    add_shared(sp_plan)
+    sp_plan.add_argument("--plan-out", default="", help="Ruta de salida del plan.")
+
+    sp_apply = sub.add_parser("apply", help="Aplicar AI/plan.md con Aider.")
+    add_shared(sp_apply)
+
+    sp_test = sub.add_parser("test", help="Ejecutar lint/tests y generar test-report.")
+    add_shared(sp_test)
+
+    sp_report = sub.add_parser("report", help="Generar AI/final.md.")
+    add_shared(sp_report)
+
+    sp_run = sub.add_parser("run", help="Ejecutar pipeline completo.")
+    add_shared(sp_run)
+
+    return p
+
+
+# -----------------------------
+# Main
+# -----------------------------
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    # Figure repo early for config discovery
-    repo_hint = Path(getattr(args, "repo", ".")).expanduser()
-    if not repo_hint.is_absolute():
-        repo_hint = repo_hint.resolve()
+    cfg, cfg_path = load_config_file(getattr(args, "config", "") or None)
 
-    cfg, cfg_path = load_config_file(repo_hint, getattr(args, "config", "") or None)
-
-    # If no subcommand provided:
-    # - If config exists -> default to run
-    # - Else show help and exit
     if not getattr(args, "cmd", None):
         if cfg:
             args.cmd = "run"
@@ -941,9 +2451,9 @@ def main() -> None:
             parser.print_help()
             raise SystemExit(1)
 
-    # Merge config into args (CLI overrides config)
     if cfg:
         args = merge_config_into_args(args, cfg)
+    args._config_path = cfg_path
 
     try:
         if args.cmd == "snapshot":
