@@ -42,3 +42,4 @@ htmlcov/
 # --- Project artifacts (your pipeline outputs) ---
 AI/
 snapshots/
+.aider*
