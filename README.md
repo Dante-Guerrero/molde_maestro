@@ -98,6 +98,13 @@ apply_enforce_plan_scope: true
 uv run molde-maestro run
 ```
 
+Si el repo objetivo contiene artefactos generados típicos como `.DS_Store`, `__pycache__/` o `*.pyc`, `molde-maestro` los detecta antes de aplicar cambios:
+
+- si son archivos no trackeados, pregunta si quieres limpiarlos antes de evaluar si el repo está dirty;
+- si son archivos trackeados, pregunta si quieres removerlos en la rama AI antes de invocar Aider;
+- si respondes `n`, no limpia nada;
+- si la sesión no es interactiva y hay limpieza necesaria, la corrida se detiene para no decidir por ti.
+
 O por flags:
 
 ```bash
@@ -122,6 +129,8 @@ Aplicar un plan ya generado:
 ```bash
 uv run molde-maestro apply --repo .
 ```
+
+`apply` usa la misma detección de artefactos generados y también confirma con `y/n` antes de limpiar archivos trackeados que puedan degradar el contexto de Aider.
 
 Ejecutar validación:
 
