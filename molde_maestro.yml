@@ -1,4 +1,4 @@
-repo: prueba_molde_maestro_easy
+repo: ../prueba_molde_maestro_easy
 goals: PROJECT_GOALS.md
 ai_dir: AI
 

@@ -51,6 +51,12 @@ def cmd_run(args) -> None:
             core.git_checkout(repo, base)
             core.git_create_branch(repo, branch)
             print(f"run: branch -> {branch} (from {base})")
+            tracked_noise = core.tracked_noise_files(repo)
+            cleaned_noise_files: list[str] = []
+            if tracked_noise and core.confirm_noise_cleanup(repo, "tracked", tracked_noise):
+                cleaned_noise_files = core.cleanup_tracked_noise_artifacts(repo)
+            if cleaned_noise_files:
+                print(f"run: cleaned tracked generated artifacts -> {', '.join(cleaned_noise_files)}")
             pre_apply_head = core.git_head_commit(repo)
 
             core.ensure_repo_ready_for_aider(repo)
@@ -90,6 +96,7 @@ def cmd_run(args) -> None:
             details["selected_files"] = apply_scope.selected_files
             details["selected_change_titles"] = [change.title for change in apply_scope.selected_changes]
             details["skipped_change_titles"] = apply_scope.skipped_change_titles
+            details["cleaned_tracked_noise_files"] = cleaned_noise_files
 
             for i in range(1, config.max_iters + 1):
                 msg = aider_msg if i == 1 else (

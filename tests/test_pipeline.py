@@ -41,6 +41,7 @@ class NormalizeModelMarkdownTests(unittest.TestCase):
 
 
 class LoadConfigFileTests(unittest.TestCase):
+    @mock.patch.dict(sys.modules, {"yaml": None})
     def test_ignores_auto_yaml_when_pyyaml_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             cwd = Path(tmpdir)
@@ -94,6 +95,8 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(mock_validate.call_args[0][0].name, "deepseek-r1")
 
     @mock.patch("molde_maestro.pipeline.git_status_porcelain", return_value="")
+    @mock.patch("molde_maestro.pipeline.untracked_noise_artifacts", return_value=[])
+    @mock.patch("molde_maestro.pipeline.cleanup_untracked_noise_artifacts", return_value=[])
     @mock.patch("molde_maestro.pipeline.command_exists", return_value=True)
     @mock.patch("molde_maestro.pipeline.ensure_git_repo")
     @mock.patch("molde_maestro.pipeline.validate_model_available")
@@ -102,6 +105,8 @@ class PreflightTests(unittest.TestCase):
         mock_validate: mock.Mock,
         _mock_repo: mock.Mock,
         _mock_exists: mock.Mock,
+        _mock_cleanup: mock.Mock,
+        _mock_untracked: mock.Mock,
         _mock_status: mock.Mock,
     ) -> None:
         repo = Path("/tmp/repo")
@@ -109,6 +114,100 @@ class PreflightTests(unittest.TestCase):
         pipeline.preflight(args, repo)
         self.assertEqual(mock_validate.call_count, 1)
         self.assertEqual(mock_validate.call_args[0][0].name, "qwen2.5-coder:14b")
+
+    @mock.patch("sys.stdin.isatty", return_value=True)
+    @mock.patch("builtins.input", return_value="y")
+    @mock.patch("molde_maestro.pipeline.validate_model_available")
+    @mock.patch("molde_maestro.pipeline.command_exists", return_value=True)
+    @mock.patch("molde_maestro.pipeline.ensure_git_repo")
+    def test_preflight_auto_cleans_untracked_noise_before_dirty_check(
+        self,
+        _mock_repo: mock.Mock,
+        _mock_exists: mock.Mock,
+        _mock_validate: mock.Mock,
+        _mock_input: mock.Mock,
+        _mock_isatty: mock.Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            pipeline.run_cmd(["git", "init"], cwd=repo, check=True)
+            pipeline.run_cmd(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+            pipeline.run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+            (repo / "PROJECT_GOALS.md").write_text("- goal\n", encoding="utf-8")
+            (repo / "src").mkdir()
+            (repo / "src" / "app.py").write_text("print('ok')\n", encoding="utf-8")
+            pipeline.run_cmd(["git", "add", "."], cwd=repo, check=True)
+            pipeline.run_cmd(["git", "commit", "-m", "initial"], cwd=repo, check=True)
+            (repo / ".DS_Store").write_text("noise", encoding="utf-8")
+
+            args = self.make_args("apply")
+            args.repo = str(repo)
+
+            pipeline.preflight(args, repo)
+
+            self.assertFalse((repo / ".DS_Store").exists())
+            self.assertEqual(pipeline.git_status_porcelain(repo), "")
+
+    @mock.patch("sys.stdin.isatty", return_value=True)
+    @mock.patch("builtins.input", return_value="n")
+    @mock.patch("molde_maestro.pipeline.validate_model_available")
+    @mock.patch("molde_maestro.pipeline.command_exists", return_value=True)
+    @mock.patch("molde_maestro.pipeline.ensure_git_repo")
+    def test_preflight_keeps_noise_when_user_rejects_cleanup(
+        self,
+        _mock_repo: mock.Mock,
+        _mock_exists: mock.Mock,
+        _mock_validate: mock.Mock,
+        _mock_input: mock.Mock,
+        _mock_isatty: mock.Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            pipeline.run_cmd(["git", "init"], cwd=repo, check=True)
+            pipeline.run_cmd(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+            pipeline.run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+            (repo / "PROJECT_GOALS.md").write_text("- goal\n", encoding="utf-8")
+            pipeline.run_cmd(["git", "add", "."], cwd=repo, check=True)
+            pipeline.run_cmd(["git", "commit", "-m", "initial"], cwd=repo, check=True)
+            (repo / ".DS_Store").write_text("noise", encoding="utf-8")
+
+            args = self.make_args("apply")
+            args.repo = str(repo)
+
+            with self.assertRaises(SystemExit) as exc:
+                pipeline.preflight(args, repo)
+
+            self.assertIn("cambios sin commit", str(exc.exception))
+            self.assertTrue((repo / ".DS_Store").exists())
+
+    @mock.patch("sys.stdin.isatty", return_value=False)
+    @mock.patch("molde_maestro.pipeline.validate_model_available")
+    @mock.patch("molde_maestro.pipeline.command_exists", return_value=True)
+    @mock.patch("molde_maestro.pipeline.ensure_git_repo")
+    def test_preflight_fails_if_cleanup_is_needed_but_session_is_not_interactive(
+        self,
+        _mock_repo: mock.Mock,
+        _mock_exists: mock.Mock,
+        _mock_validate: mock.Mock,
+        _mock_isatty: mock.Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            pipeline.run_cmd(["git", "init"], cwd=repo, check=True)
+            pipeline.run_cmd(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+            pipeline.run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+            (repo / "PROJECT_GOALS.md").write_text("- goal\n", encoding="utf-8")
+            pipeline.run_cmd(["git", "add", "."], cwd=repo, check=True)
+            pipeline.run_cmd(["git", "commit", "-m", "initial"], cwd=repo, check=True)
+            (repo / ".DS_Store").write_text("noise", encoding="utf-8")
+
+            args = self.make_args("apply")
+            args.repo = str(repo)
+
+            with self.assertRaises(SystemExit) as exc:
+                pipeline.preflight(args, repo)
+
+            self.assertIn("no es interactiva", str(exc.exception))
 
 
 class MergeConfigTests(unittest.TestCase):
@@ -152,6 +251,17 @@ class MergeConfigTests(unittest.TestCase):
         self.assertEqual(merged.semantic_validation_mode, "ast")
         self.assertTrue(merged.semantic_validation_strict)
         self.assertEqual(merged.semantic_validation_timeout, 12)
+
+    def test_resolves_relative_repo_from_config_file_directory(self) -> None:
+        parser = pipeline.build_parser()
+        args = parser.parse_args(["run"])
+        cfg = {"repo": "../prueba_molde_maestro_easy"}
+        cfg_path = Path("/Users/dante/github/molde_maestro/molde_maestro.yml")
+
+        merged = pipeline.merge_config_into_args(args, cfg)
+        resolved = pipeline.cli_module.resolve_config_relative_paths(merged, cfg, cfg_path)
+
+        self.assertEqual(resolved.repo, str(Path("/Users/dante/github/prueba_molde_maestro_easy").resolve()))
 
 
 class PlanStrategyTests(unittest.TestCase):
@@ -572,6 +682,45 @@ class CommandArtifactTests(unittest.TestCase):
             pipeline.ensure_repo_ready_for_aider(repo)
             exclude = (repo / ".git" / "info" / "exclude").read_text(encoding="utf-8")
         self.assertIn("AI/", exclude)
+        self.assertIn(".DS_Store", exclude)
+
+    def test_cleanup_tracked_noise_artifacts_removes_and_commits_generated_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            pipeline.run_cmd(["git", "init"], cwd=repo, check=True)
+            pipeline.run_cmd(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+            pipeline.run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+
+            (repo / "src" / "calculator" / "__pycache__").mkdir(parents=True)
+            tracked_noise = repo / "src" / "calculator" / "__pycache__" / "core.cpython-314.pyc"
+            tracked_noise.write_bytes(b"\x00\x01compiled")
+            (repo / "README.md").write_text("hello\n", encoding="utf-8")
+
+            pipeline.run_cmd(["git", "add", "."], cwd=repo, check=True)
+            pipeline.run_cmd(["git", "commit", "-m", "initial"], cwd=repo, check=True)
+            before_head = pipeline.git_head_commit(repo)
+
+            removed = pipeline.cleanup_tracked_noise_artifacts(repo)
+            after_head = pipeline.git_head_commit(repo)
+
+            self.assertEqual(removed, ["src/calculator/__pycache__/core.cpython-314.pyc"])
+            self.assertNotEqual(before_head, after_head)
+            self.assertFalse(tracked_noise.exists())
+            code, tracked_after, _ = pipeline.run_cmd(["git", "ls-files"], cwd=repo, capture=True)
+            self.assertEqual(code, 0)
+            self.assertNotIn("src/calculator/__pycache__/core.cpython-314.pyc", tracked_after.splitlines())
+
+    @mock.patch("sys.stdin.isatty", return_value=True)
+    @mock.patch("builtins.input", return_value="y")
+    def test_confirm_noise_cleanup_accepts_yes(self, _mock_input: mock.Mock, _mock_isatty: mock.Mock) -> None:
+        accepted = pipeline.confirm_noise_cleanup(Path("/tmp/repo"), "tracked", ["a.pyc"])
+        self.assertTrue(accepted)
+
+    @mock.patch("sys.stdin.isatty", return_value=True)
+    @mock.patch("builtins.input", return_value="n")
+    def test_confirm_noise_cleanup_rejects_no(self, _mock_input: mock.Mock, _mock_isatty: mock.Mock) -> None:
+        accepted = pipeline.confirm_noise_cleanup(Path("/tmp/repo"), "tracked", ["a.pyc"])
+        self.assertFalse(accepted)
 
     def make_plan_args(self, repo: Path) -> argparse.Namespace:
         return argparse.Namespace(

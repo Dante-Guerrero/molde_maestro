@@ -27,6 +27,10 @@ def cmd_apply(args) -> None:
             branch = config.branch.strip() or f"ai/{core.now_stamp()}-improvements"
             core.git_checkout(repo, base)
             core.git_create_branch(repo, branch)
+            tracked_noise = core.tracked_noise_files(repo)
+            cleaned_noise_files: list[str] = []
+            if tracked_noise and core.confirm_noise_cleanup(repo, "tracked", tracked_noise):
+                cleaned_noise_files = core.cleanup_tracked_noise_artifacts(repo)
             pre_apply_head = core.git_head_commit(repo)
 
             core.ensure_repo_ready_for_aider(repo)
@@ -77,6 +81,7 @@ def cmd_apply(args) -> None:
             details["selected_files"] = apply_scope.selected_files
             details["selected_change_titles"] = [change.title for change in apply_scope.selected_changes]
             details["skipped_change_titles"] = apply_scope.skipped_change_titles
+            details["cleaned_tracked_noise_files"] = cleaned_noise_files
             details["stdout_excerpt"] = core.truncate(stdout, 2000)
             if rc != 0 or core.aider_output_has_fatal_error(stdout, err):
                 raise core.ExecutionFailure(

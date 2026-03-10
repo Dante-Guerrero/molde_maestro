@@ -36,6 +36,8 @@ from pathlib import Path
 from typing import Optional, Tuple, List, Any, Dict
 
 from .git_ops import (
+    cleanup_tracked_noise_artifacts,
+    cleanup_untracked_noise_artifacts,
     collect_git_changed_files,
     collect_git_diff,
     ensure_git_repo,
@@ -49,6 +51,8 @@ from .git_ops import (
     git_status_porcelain,
     infer_base_ref,
     resolve_base_branch,
+    tracked_noise_files,
+    untracked_noise_artifacts,
 )
 from .models import (
     AIDER_FATAL_MARKERS,
@@ -247,6 +251,23 @@ def infer_validation_changed_files(repo: Path, args) -> Tuple[List[str], str]:
         collect_git_changed_files_fn=collect_git_changed_files,
         run_cmd_fn=run_cmd,
     )
+
+
+def confirm_noise_cleanup(repo: Path, label: str, paths: list[str]) -> bool:
+    if not paths:
+        return False
+    if not sys.stdin.isatty():
+        raise SystemExit(
+            "Se detectó limpieza necesaria en el repo objetivo, pero la sesión no es interactiva.\n"
+            "Vuelve a correr en una terminal interactiva para responder y/n."
+        )
+    sample = ", ".join(paths[:5])
+    extra = "" if len(paths) <= 5 else f" ... (+{len(paths) - 5} más)"
+    answer = input(
+        f"Se detectaron artefactos generados para limpiar ({label}) en {repo}: {sample}{extra}. "
+        "¿Quieres limpiarlos ahora? [y/N] "
+    ).strip().lower()
+    return answer in {"y", "yes"}
 
 
 def build_reasoner_prompt(
@@ -878,6 +899,9 @@ def preflight(args, repo: Path) -> None:
                 raise SystemExit(f"No se encontró el ejecutable del lint_cmd: {first}")
 
     if not args.allow_dirty_repo and args.cmd in {"apply", "run"}:
+        untracked_noise = untracked_noise_artifacts(repo)
+        if untracked_noise and confirm_noise_cleanup(repo, "untracked", untracked_noise):
+            cleanup_untracked_noise_artifacts(repo)
         dirty = git_status_porcelain(repo)
         if dirty:
             raise SystemExit(

@@ -128,6 +128,9 @@ def merge_config_into_args(args: argparse.Namespace, cfg: dict) -> argparse.Name
 
         if isinstance(cur, str):
             default_strings = {
+                "repo": ".",
+                "goals": "PROJECT_GOALS.md",
+                "ai_dir": "AI",
                 "plan_mode": "balanced",
                 "plan_fallback_reasoner": "",
                 "validation_profile": "auto",
@@ -164,6 +167,22 @@ def merge_config_into_args(args: argparse.Namespace, cfg: dict) -> argparse.Name
         else:
             if cur is None:
                 set_(af, val)
+
+    return args
+
+
+def resolve_config_relative_paths(args: argparse.Namespace, cfg: dict, cfg_path: Optional[Path]) -> argparse.Namespace:
+    if not cfg_path:
+        return args
+
+    cfg_dir = cfg_path.parent
+
+    if "repo" in cfg and hasattr(args, "repo"):
+        repo_value = str(getattr(args, "repo", "") or "").strip()
+        if repo_value:
+            repo_path = Path(repo_value).expanduser()
+            if not repo_path.is_absolute():
+                args.repo = str((cfg_dir / repo_path).resolve())
 
     return args
 
@@ -276,6 +295,7 @@ def main() -> None:
 
     if cfg:
         args = merge_config_into_args(args, cfg)
+        args = resolve_config_relative_paths(args, cfg, cfg_path)
     args._config_path = cfg_path
 
     try:

@@ -39,6 +39,7 @@ class PlanAttemptSpec:
 DEFAULT_AIDER_GITIGNORE_PATTERNS = [
     "AI/",
     ".aider*",
+    ".DS_Store",
     ".env",
     ".venv/",
     "venv/",

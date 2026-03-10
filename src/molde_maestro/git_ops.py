@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import shutil
 import shlex
 from pathlib import Path
 
 from .utils import run_cmd, truncate
+
+
+NOISE_ARTIFACT_BASENAMES = {".DS_Store"}
+NOISE_ARTIFACT_SUFFIXES = {".pyc", ".pyo"}
+NOISE_ARTIFACT_DIRS = {"__pycache__"}
 
 
 def ensure_git_repo(repo: Path) -> None:
@@ -40,6 +46,74 @@ def git_create_branch(repo: Path, branch_name: str) -> None:
 def git_status_porcelain(repo: Path) -> str:
     _, out, _ = run_cmd("git status --porcelain", cwd=repo)
     return out.strip()
+
+
+def is_noise_artifact_path(path: str) -> bool:
+    candidate = Path(path)
+    if candidate.name in NOISE_ARTIFACT_BASENAMES:
+        return True
+    if candidate.suffix in NOISE_ARTIFACT_SUFFIXES:
+        return True
+    if any(part in NOISE_ARTIFACT_DIRS for part in candidate.parts):
+        return True
+    return False
+
+
+def git_status_entries(repo: Path) -> list[tuple[str, str]]:
+    _, out, _ = run_cmd("git status --porcelain", cwd=repo)
+    entries: list[tuple[str, str]] = []
+    for raw_line in out.splitlines():
+        if not raw_line.strip():
+            continue
+        status = raw_line[:2]
+        path_text = raw_line[3:]
+        if " -> " in path_text:
+            path_text = path_text.split(" -> ", 1)[1]
+        entries.append((status, path_text.strip()))
+    return entries
+
+
+def remove_paths(repo: Path, paths: list[str]) -> list[str]:
+    removed: list[str] = []
+    for rel in paths:
+        target = repo / rel
+        if target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+            removed.append(rel)
+            continue
+        if target.exists():
+            target.unlink()
+            removed.append(rel)
+    return removed
+
+
+def cleanup_untracked_noise_artifacts(repo: Path) -> list[str]:
+    untracked_noise = untracked_noise_artifacts(repo)
+    return remove_paths(repo, untracked_noise)
+
+
+def tracked_noise_files(repo: Path) -> list[str]:
+    code, out, _ = run_cmd("git ls-files", cwd=repo, capture=True)
+    if code != 0:
+        return []
+    return [line.strip() for line in out.splitlines() if line.strip() and is_noise_artifact_path(line.strip())]
+
+
+def untracked_noise_artifacts(repo: Path) -> list[str]:
+    return [
+        path
+        for status, path in git_status_entries(repo)
+        if status == "??" and is_noise_artifact_path(path)
+    ]
+
+
+def cleanup_tracked_noise_artifacts(repo: Path, commit_message: str = "chore: remove generated artifacts") -> list[str]:
+    tracked_noise = tracked_noise_files(repo)
+    if not tracked_noise:
+        return []
+    run_cmd(["git", "rm", "-f", "--", *tracked_noise], cwd=repo, check=True)
+    run_cmd(["git", "commit", "-m", commit_message], cwd=repo, check=True)
+    return tracked_noise
 
 
 def git_ref_exists(repo: Path, ref: str) -> bool:
