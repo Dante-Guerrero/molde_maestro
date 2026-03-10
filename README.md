@@ -1,412 +1,219 @@
 # molde_maestro
 
-`molde_maestro` es un pipeline reproducible para **mejorar repositorios** usando:
+## 1. Función principal del repositorio
 
-- un **modelo razonador** (por ejemplo vía `ollama`) que genera un plan de cambios,
-- **Aider** para implementar ese plan en una rama dedicada,
-- ejecución de **lint + tests** para validar,
-- y un **reporte final** que contrasta resultados contra objetivos del proyecto.
+`molde_maestro` es un pipeline CLI para automatizar mejoras sobre repositorios Git con este flujo:
 
-Todo queda auditado en artefactos dentro de `AI/` (plan, logs, reportes).
+1. leer objetivos desde `PROJECT_GOALS.md`
+2. generar un plan con un modelo reasoner
+3. aplicar cambios con `aider`
+4. validar el resultado con tests, lint y chequeos semánticos
+5. generar un reporte final con evidencia real del diff y de la validación
 
----
+El objetivo del proyecto no es solo “editar código”, sino dejar una corrida reproducible, auditable y con artefactos en `AI/` para entender qué se planeó, qué se cambió y cómo se validó.
 
-## Qué es (y qué no es)
+## 2. Cómo usarlo paso a paso
 
-- **Es** un “motor” que corre sobre un **repo objetivo** (otro repo), genera un plan, crea una rama, aplica cambios con Aider y valida.
-- **No es** un plugin mágico de GitHub. Es un CLI que tú ejecutas localmente (o en CI si quieres sufrir profesionalmente).
+### Requisitos
 
-El comando principal es:
-
-- `molde-maestro ...`
-
-(Se instala desde este repo porque está empaquetado como proyecto Python con `pyproject.toml` y entrypoint).
-
----
-
-## Flujo: qué hace exactamente
-
-Flujo completo (subcomando `run`):
-
-1) (Opcional) **snapshot** del repo con `git archive` (zip sin `.git`)
-2) El **razonador** genera `AI/plan.md` (plan estructurado de cambios)
-3) Se crea una **rama** `ai/<timestamp>-improvements`
-4) **Aider** implementa el plan (con auto-commits)
-5) Se corre **lint** (opcional) y **tests**
-6) Si fallan tests, reintenta hasta `max_iters` veces, usando el reporte como feedback a Aider
-7) El **razonador** genera `AI/final.md` (conclusiones vs objetivos + evidencia)
-
----
-
-## Requisitos
-
-### Obligatorios
-- Python 3.11+ (recomendado)
+- Python 3.11+
+- `uv`
 - `git`
-- El repo objetivo debe ser un repo git real
+- `aider`
+- `ollama`
+- al menos un modelo disponible en Ollama para:
+  - `reasoner`
+  - `aider_model`
 
-### Para usar modelos locales con Ollama
-- `ollama` instalado y funcionando
-- un modelo razonador disponible (ej: `deepseek-r1`)
+### Instalación
 
-### Para aplicar cambios con Aider
-- `aider` instalado y accesible en tu `PATH`
-- un modelo “coder” configurado para Aider (ej: `ollama:qwen3-coder:14b`)
-
-> Nota: `molde_maestro` ejecuta `aider` como proceso externo. Si `aider` no existe en tu terminal, no hay magia que lo arregle.
-
----
-
-## Instalación con `uv` (recomendado)
-
-### 1) Instala `uv`
-Si aún no lo tienes, instala `uv` siguiendo el método oficial de tu sistema (macOS, Linux o Windows).  
-(En macOS suele ser por `brew install uv`, y en otros sistemas hay instalador).
-
-### 2) Crea el entorno e instala `molde_maestro`
-Desde la raíz de este repo (`molde_maestro/`):
-
-```bash id="pxwtp5"
-uv sync
-```
-
-Esto:
-- crea/usa un entorno virtual (gestionado por `uv`)
-- instala dependencias del proyecto (según `pyproject.toml` y `uv.lock`)
-- deja disponible el comando `molde-maestro` dentro del entorno
-
-### 2.1) Instala herramientas de desarrollo y prueba
-Si vas a trabajar en el repo o correr la suite completa:
+Desde la raíz del repo:
 
 ```bash
 uv sync --extra dev
 ```
 
-Eso instala al menos:
-- `pytest`
-- `ruff`
-
-Pruebas locales recomendadas:
+Si quieres ejecutar el CLI sin instalarlo globalmente:
 
 ```bash
-uv run pytest -q
-uv run python -m unittest discover -s tests -q
-uv run ruff check .
-```
-
-### 3) Ejecuta el CLI dentro del entorno
-Opción A (simple): prefix con `uv run`:
-
-```bash id="17twmd"
 uv run molde-maestro --help
 ```
 
-Opción B (si prefieres activar el venv que `uv` creó): usa el venv de `.venv/` (si aplica en tu setup) y ejecuta `molde-maestro` normalmente.
+### Preparar el repo objetivo
 
-> Consejo práctico: usa `uv run ...` y listo. Menos ceremonias, menos drama.
+En el repo que quieres mejorar necesitas, como mínimo:
 
----
+1. que sea un repo Git
+2. que tenga un archivo `PROJECT_GOALS.md`
+3. que tenga un comando de validación razonable o que el pipeline pueda inferir uno
 
-## Conceptos clave
+Ejemplo mínimo de `PROJECT_GOALS.md`:
 
-### `PROJECT_GOALS.md`
-Archivo (en la raíz del repo objetivo, por defecto) con los **objetivos generales**. Es la referencia principal para evaluar resultados.
+```md
+# PROJECT_GOALS
+
+- Corrige el bug de autenticación en `src/app/auth.py`.
+- No agregues dependencias nuevas.
+- Mantén los cambios acotados.
+```
+
+### Configuración
+
+Puedes pasar todo por flags o crear un archivo `molde_maestro.yml`.
 
 Ejemplo:
-- No romper API pública
-- Mejorar cobertura de tests
-- Reducir errores en el módulo X
 
-### Directorio `AI/`
-Por defecto el pipeline genera artefactos en el repo objetivo:
-
-- `AI/plan.md`  
-  Plan del razonador: cambios ordenados, criterios de aceptación y comandos de validación.
-- `AI/aider-log.txt`  
-  Log de ejecución de Aider.
-- `AI/test-report.md` y `AI/test-report.json`  
-  Resultados de lint/tests.
-- `AI/final.md`  
-  Informe final: objetivos vs evidencia (diff + reportes).
-- `AI/snapshots/<timestamp>.zip` (si `zip: true`)  
-  Snapshot reproducible del repo (vía `git archive`).
-
----
-
-## Archivo de configuración
-
-Para no pasar 10 flags siempre, `molde_maestro` busca config automáticamente en la **raíz del repo desde donde ejecutas**:
-
-1) `--config <ruta>`
-2) `molde_maestro.yml`
-3) `molde_maestro.yaml`
-4) `molde_maestro.json`
-
-**Regla:** la CLI siempre pisa el config.
-
-### Ejemplo `molde_maestro.yml`
-
-```yaml id="hbvkux"
+```yaml
 repo: .
 goals: PROJECT_GOALS.md
 ai_dir: AI
 
-reasoner: "ollama:deepseek-r1"
-aider_model: "ollama:qwen3-coder:14b"
+reasoner: "ollama:qwen2.5-coder:7b"
+aider_model: "ollama:qwen2.5-coder:7b"
 
-# Opcional: si no lo defines, el pipeline intenta derivarlo
-# automáticamente desde el repo objetivo.
-test_cmd: "pytest -q"
-lint_cmd: "ruff check . || true"
+plan_mode: fast
+reasoner_timeout: 120
+report_timeout: 120
+aider_timeout: 600
+test_timeout: 120
 
-max_iters: 2
-zip: true
+validation_profile: auto
+semantic_validation: true
+semantic_validation_mode: auto
+semantic_validation_strict: true
+
+test_cmd: "python3 -m compileall src"
+lint_cmd: ""
+
+max_iters: 1
+zip: false
+apply_max_plan_changes: 1
+apply_limit_to_plan_files: true
+apply_enforce_plan_scope: true
 ```
 
-También se aceptan claves con guiones (ej: `max-iters`) y se normalizan a guion bajo (`max_iters`).
+### Ejecutar el pipeline completo
 
----
-
-## Primeros pasos (en 5 minutos)
-
-Este proyecto asume:
-1) Tienes un **repo objetivo** (el que quieres mejorar) y es un repo git real.
-2) Tienes instalados los “obreros”: **Ollama** (razonador) y **Aider** (implementación).
-
-### 0) Instala herramientas (una vez)
-- Instala **Ollama**, y descarga tus modelos (ej: `deepseek-r1` y `qwen3-coder:14b`).
-- Instala **Aider**, y verifica que esto funcione:
-
-```bash id="eya72k"
-aider --version
-```
-
-### 1) Prepara el repo objetivo
-En la raíz del repo objetivo crea/edita:
-
-- `PROJECT_GOALS.md`
-
-Ejemplo mínimo:
-- No romper API pública
-- Mejorar cobertura de tests
-- Reducir errores en módulo X
-
-### 2) Define la configuración del pipeline
-Crea `molde_maestro.yml` en **este repo** (`molde_maestro/`) o donde prefieras ejecutarlo, y apunta `repo:` al repo objetivo.
-
-Ejemplo si ambos repos viven en la misma carpeta padre:
-
-```yaml id="wnwpvu"
-repo: ../exam_pipeline_starter
-goals: PROJECT_GOALS.md
-ai_dir: AI
-
-reasoner: "ollama:deepseek-r1"
-aider_model: "ollama:qwen3-coder:14b"
-
-# Opcional: si el repo objetivo tiene suficiente evidencia
-# (por ejemplo `tests/`, `src/`, `.venv`), puede autodetectarse.
-test_cmd: "pytest -q"
-lint_cmd: "ruff check . || true"
-
-max_iters: 2
-zip: true
-```
-
-**Importante:** `goals:` se resuelve dentro del repo objetivo.  
-Este ejemplo espera que exista: `exam_pipeline_starter/PROJECT_GOALS.md`.
-
-### 3) Ejecuta
-Desde la raíz de `molde_maestro/`:
-
-```bash id="cwvyxf"
+```bash
 uv run molde-maestro run
 ```
 
-Si existe `molde_maestro.yml/.yaml/.json`, el CLI tomará valores de ahí y solo necesitas `run`.
-Si omites `test_cmd`, `run` y `test` intentarán derivar un comando válido automáticamente.
+O por flags:
 
-### 4) Revisa resultados (en el repo objetivo)
-En el repo objetivo verás:
-
-- `AI/plan.md`
-- `AI/test-report.md` (+ `.json`)
-- `AI/final.md`
-
-Y una rama tipo `ai/<timestamp>-improvements`. Revisa el diff y los reportes antes de mergear.
-
----
-
-## Ejecutar el pipeline sobre OTRO repositorio (caso típico)
-
-Puedes mantener este repo (`molde_maestro/`) como “motor” y ejecutar el pipeline sobre otro repo objetivo (por ejemplo `exam_pipeline_starter/`).
-
-### Estructura recomendada
-
-```text id="akqahc"
-<carpeta_padre>/
-├─ molde_maestro/
-│  ├─ pyproject.toml
-│  ├─ uv.lock
-│  ├─ molde_maestro.yml
-│  └─ src/molde_maestro/pipeline.py
-│
-└─ exam_pipeline_starter/
-   ├─ .git/
-   ├─ PROJECT_GOALS.md
-   ├─ pyproject.toml          (o requirements.txt / package.json, según stack)
-   ├─ src/                    (o app/, etc.)
-   ├─ tests/                  (si existe)
-   └─ AI/                     (se crea cuando corras el pipeline)
-      ├─ plan.md
-      ├─ aider-log.txt
-      ├─ test-report.md
-      ├─ test-report.json
-      ├─ final.md
-      └─ snapshots/
-         └─ 20260305-123456.zip   (si zip=true)
+```bash
+uv run molde-maestro run \
+  --repo . \
+  --goals PROJECT_GOALS.md \
+  --reasoner ollama:qwen2.5-coder:7b \
+  --aider-model ollama:qwen2.5-coder:7b \
+  --test-cmd "python3 -m compileall src"
 ```
 
-### Paso a paso (real)
-1) En `exam_pipeline_starter/`, crea/edita `PROJECT_GOALS.md`.
-2) En `molde_maestro/molde_maestro.yml`, configura `repo: ../exam_pipeline_starter`.
-3) Ejecuta:
+### Ejecutar subcomandos por separado
 
-```bash id="zqcrpt"
-cd /ruta/a/molde_maestro
-uv run molde-maestro run
+Generar solo el plan:
+
+```bash
+uv run molde-maestro plan --repo .
 ```
 
-4) Revisa artefactos en:
-- `exam_pipeline_starter/AI/plan.md`
-- `exam_pipeline_starter/AI/test-report.md`
-- `exam_pipeline_starter/AI/final.md`
+Aplicar un plan ya generado:
 
----
-
-## Subcomandos útiles
-
-> Si usas config, puedes omitir muchos parámetros. Si no, pásalos por CLI.
-
-### `run` (todo el flujo)
-Ejemplo “todo por CLI”:
-
-```bash id="kzouia"
-uv run molde-maestro run   --repo .   --goals PROJECT_GOALS.md   --reasoner ollama:deepseek-r1   --aider-model ollama:qwen3-coder:14b   --test-cmd "pytest -q"   --lint-cmd "ruff check . || true"   --max-iters 2   --zip
+```bash
+uv run molde-maestro apply --repo .
 ```
 
-### `plan` (solo generar plan)
-```bash id="tjuo7s"
-uv run molde-maestro plan --reasoner ollama:deepseek-r1
+Ejecutar validación:
+
+```bash
+uv run molde-maestro test --repo . --test-cmd "python3 -m compileall src"
 ```
 
-### `apply` (solo implementar plan con Aider)
-Requiere `AI/plan.md`:
+Generar el reporte final:
 
-```bash id="359znz"
-uv run molde-maestro apply --aider-model ollama:qwen3-coder:14b
+```bash
+uv run molde-maestro report --repo .
 ```
 
-Opciones útiles:
-- `--branch "ai/mi-rama"`
-- `--base main`
-- `--allowed-file src/app.py` (repetible; restringe qué archivos puede tocar)
-- `--aider-extra-arg ...` (para pasar flags extra al CLI de Aider)
+Crear snapshot zip:
 
-### `test` (solo lint + tests)
-Genera `AI/test-report.*`:
-
-```bash id="a8d3a7"
-uv run molde-maestro test   --test-cmd "pytest -q"   --lint-cmd "ruff check . || true"
+```bash
+uv run molde-maestro snapshot --repo . --zip
 ```
 
-### `report` (solo reporte final)
-Requiere `AI/plan.md` y preferiblemente `AI/test-report.md`:
+### Qué produce una corrida
 
-```bash id="mphq12"
-uv run molde-maestro report --reasoner ollama:deepseek-r1
+Dentro del repo objetivo se crea `AI/` con artefactos como:
+
+- `plan.md`
+- `test-report.md`
+- `final.md`
+- `run-metadata.json`
+- prompts y respuestas crudas del modelo
+- logs de `aider`
+
+### Cómo validar este mismo repositorio
+
+Tests:
+
+```bash
+python3 -m unittest discover -s tests -q
 ```
 
-Opcional:
-- `--base-ref <ref>` para controlar el diff usado como evidencia.
+Opcional con `pytest`:
 
-### `snapshot` (zip del repo)
-```bash id="a842ob"
-uv run molde-maestro snapshot --zip
+```bash
+uv run pytest -q
 ```
 
----
+Lint:
 
-## Cómo decide el “base diff” para el reporte
-
-Para comparar cambios, el pipeline intenta:
-1) `merge-base` con el upstream (`@{u}`) si existe
-2) si no, usa `HEAD~1`
-
-Luego usa:
-
-- `git diff <base_ref>...HEAD`
-
-Eso alimenta el reporte `AI/final.md`.
-
----
-
-## Personalización común
-
-### Cambiar comandos según stack
-
-**Node**
-```yaml id="uncwxb"
-test_cmd: "npm test"
-lint_cmd: "npm run lint || true"
+```bash
+uv run ruff check .
 ```
 
-**Go**
-```yaml id="869dnd"
-test_cmd: "go test ./..."
-```
+## 3. Explicación del contenido de todos los archivos
 
-**Rust**
-```yaml id="h5af7d"
-test_cmd: "cargo test"
-```
+### Archivos de raíz
 
-### Repos grandes
-Puedes forzar contexto adicional para el razonador:
+- `README.md`: documentación principal del proyecto.
+- `LICENSE`: licencia del repositorio.
+- `pyproject.toml`: metadatos del paquete, dependencias, extras de desarrollo y entrypoint `molde-maestro`.
+- `uv.lock`: lockfile de dependencias para instalaciones reproducibles con `uv`.
+- `molde_maestro.yml`: ejemplo o configuración local para correr el pipeline sin repetir flags.
 
-```yaml id="jcorjd"
-extra_context:
-  - src/core.py
-  - docs/architecture.md
-```
+### Código fuente en `src/molde_maestro/`
 
----
+- `src/molde_maestro/__init__.py`: marca el paquete Python `molde_maestro`.
+- `src/molde_maestro/cli.py`: frontera principal de la CLI; define parser, carga de config, merge de flags y dispatch de comandos.
+- `src/molde_maestro/pipeline.py`: capa de compatibilidad y orquestación compartida; conserva wrappers y helpers centrales usados por comandos y tests.
+- `src/molde_maestro/command_config.py`: dataclasses tipadas para normalizar argumentos por subcomando.
+- `src/molde_maestro/utils.py`: utilidades generales de IO, ejecución de comandos, timestamps, lectura/escritura segura y helpers comunes.
+- `src/molde_maestro/git_ops.py`: helpers Git para refs, diffs, ramas, snapshots y detección de cambios.
+- `src/molde_maestro/models.py`: integración con modelos y `aider`; prompts, validación de modelos, llamadas a Ollama y preparación del repo para edición.
+- `src/molde_maestro/validation.py`: lógica de validación automática, detección de contexto Python, smoke imports, auditoría de dependencias y generación de `test-report`.
+- `src/molde_maestro/reporting.py`: recorder de corridas, metadata, manejo de stages y helpers de reporte/errores.
 
-## Troubleshooting
+### Subcomandos en `src/molde_maestro/commands/`
 
-### “No se encuentra `aider`”
-Instala Aider y asegúrate de que el comando exista en tu shell:
+- `src/molde_maestro/commands/__init__.py`: exporta los subcomandos disponibles.
+- `src/molde_maestro/commands/plan.py`: implementa `molde-maestro plan`.
+- `src/molde_maestro/commands/apply.py`: implementa `molde-maestro apply`.
+- `src/molde_maestro/commands/test.py`: implementa `molde-maestro test`.
+- `src/molde_maestro/commands/report.py`: implementa `molde-maestro report`.
+- `src/molde_maestro/commands/run.py`: implementa `molde-maestro run`, que orquesta el flujo completo.
+- `src/molde_maestro/commands/snapshot.py`: implementa `molde-maestro snapshot`.
 
-```bash id="fu990j"
-aider --version
-```
+### Tests
 
-### El razonador inventa comandos de test/lint
-Ponlos explícitos en config. El plan puede sugerir cosas, pero el pipeline ejecuta lo que tú defines.
+- `tests/test_pipeline.py`: suite unitaria principal; cubre config, parser, validación, reportes, comandos y regresiones del pipeline.
 
-### Aider cambió flags (CLI mismatch)
-Revisa:
+## Resumen rápido
 
-```bash id="4ndxct"
-aider --help
-```
+Si quieres usar el proyecto con lo mínimo:
 
-Y ajusta la configuración/args extra (`--aider-extra-arg`) según lo que soporte tu versión.
-
----
-
-## Buenas prácticas (para que no te odies mañana)
-
-- Trabaja siempre en la **rama** generada por el pipeline.
-- Revisa `AI/plan.md` antes de aplicar en proyectos críticos.
-- Revisa diff (`git diff`) y `AI/final.md` antes de mergear.
+1. instala dependencias con `uv sync --extra dev`
+2. prepara un repo Git con `PROJECT_GOALS.md`
+3. configura `reasoner`, `aider_model` y `test_cmd`
+4. ejecuta `uv run molde-maestro run`
+5. revisa `AI/plan.md`, `AI/test-report.md` y `AI/final.md`
