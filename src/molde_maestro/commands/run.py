@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 from .. import pipeline as core
@@ -9,8 +10,9 @@ from ..command_config import RunCommandConfig
 
 def cmd_run(args) -> None:
     config = RunCommandConfig.from_args(args)
-    repo, ai_dir, recorder = core.init_run_context(config._raw_args)
+    repo = Path(config.repo).expanduser().resolve()
     core.preflight(config._raw_args, repo)
+    repo, ai_dir, recorder = core.init_run_context(config._raw_args)
 
     core.require_nonempty(config.reasoner, "reasoner", "Config: reasoner: 'ollama:deepseek-r1'")
     core.require_nonempty(config.aider_model, "aider_model", "Config: aider_model: 'ollama:qwen3-coder:14b'")
@@ -194,15 +196,6 @@ def cmd_run(args) -> None:
                 git_diff,
                 core.read_text(ai_dir / "run-metadata.json"),
             )
-            projected_status = "ok" if final_passed else test_summary.get("status", "failed")
-            final_md = core.build_grounded_final_report(
-                core.project_reported_metadata(recorder.metadata, projected_status),
-                plan_md,
-                core.read_text(ai_dir / "test-report.md"),
-                changed_files,
-                git_diff,
-            )
-            core.safe_write(ai_dir / "final.md", final_md)
             details["artifact"] = str(ai_dir / "final.md")
             details["base_ref"] = base_ref
             details["report_timeout"] = core.effective_report_timeout(config._raw_args)
@@ -215,6 +208,16 @@ def cmd_run(args) -> None:
                     core.effective_report_timeout(config._raw_args),
                 )
             )
+            projected_status = "ok" if final_passed else test_summary.get("status", "failed")
+            final_md = core.build_grounded_final_report(
+                core.project_reported_metadata(recorder.metadata, projected_status),
+                plan_md,
+                core.read_text(ai_dir / "test-report.md"),
+                changed_files,
+                git_diff,
+                validation_command=test_cmd,
+            )
+            core.safe_write(ai_dir / "final.md", final_md)
             print(f"run: final -> {ai_dir / 'final.md'} (base_ref={base_ref})")
     except BaseException as exc:
         failed_stage = next((stage["name"] for stage in reversed(recorder.metadata["stages"]) if stage["status"] in {"running", "failed", "timeout"}), "run")
@@ -232,3 +235,12 @@ def cmd_run(args) -> None:
 
     final_status = test_summary.get("status", "ok") if final_passed else test_summary.get("status", "failed")
     recorder.complete_run(final_status, {"tests_passed": final_passed, "test_status": test_summary.get("status", "failed"), "validation_profile": validation_plan.profile})
+    final_md = core.build_grounded_final_report(
+        recorder.metadata,
+        plan_md,
+        core.read_text(ai_dir / "test-report.md"),
+        core.collect_git_changed_files(repo, core.infer_base_ref(repo)),
+        core.collect_git_diff(repo, core.infer_base_ref(repo)),
+        validation_command=test_cmd,
+    )
+    core.safe_write(ai_dir / "final.md", final_md)

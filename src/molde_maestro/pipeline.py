@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import ast
 import dataclasses
+import importlib
 import json
 import os
 import re
@@ -215,7 +216,7 @@ def build_plan_attempt_specs(args) -> List[PlanAttemptSpec]:
 
 
 def detect_validation_commands(repo: Path, args) -> List[str]:
-    return __import__("molde_maestro.validation", fromlist=["detect_validation_commands"]).detect_validation_commands(
+    return importlib.import_module(".validation", __package__).detect_validation_commands(
         repo,
         args,
         resolve_validation_plan,
@@ -223,7 +224,7 @@ def detect_validation_commands(repo: Path, args) -> List[str]:
 
 
 def detect_validation_context(repo: Path) -> ValidationContext:
-    return __import__("molde_maestro.validation", fromlist=["detect_validation_context"]).detect_validation_context(
+    return importlib.import_module(".validation", __package__).detect_validation_context(
         repo,
         runner_executes_python_fn=runner_executes_python,
         python_module_available_fn=python_module_available,
@@ -231,7 +232,7 @@ def detect_validation_context(repo: Path) -> ValidationContext:
 
 
 def resolve_validation_plan(repo: Path, args) -> ValidationPlan:
-    return __import__("molde_maestro.validation", fromlist=["resolve_validation_plan"]).resolve_validation_plan(
+    return importlib.import_module(".validation", __package__).resolve_validation_plan(
         repo,
         args,
         detect_validation_context_fn=detect_validation_context,
@@ -239,7 +240,7 @@ def resolve_validation_plan(repo: Path, args) -> ValidationPlan:
 
 
 def infer_validation_changed_files(repo: Path, args) -> Tuple[List[str], str]:
-    return __import__("molde_maestro.validation", fromlist=["infer_validation_changed_files"]).infer_validation_changed_files(
+    return importlib.import_module(".validation", __package__).infer_validation_changed_files(
         repo,
         args,
         infer_base_ref_fn=infer_base_ref,
@@ -255,7 +256,7 @@ def build_reasoner_prompt(
     settings: PlanSettings,
     validation_commands: List[str],
 ) -> str:
-    return __import__("molde_maestro.models", fromlist=["build_reasoner_prompt"]).build_reasoner_prompt(
+    return importlib.import_module(".models", __package__).build_reasoner_prompt(
         repo,
         goals_text,
         extra_context_files,
@@ -274,7 +275,7 @@ def maybe_write_model_report(
     repo: Path,
     timeout: int,
 ) -> Dict[str, Any]:
-    return __import__("molde_maestro.models", fromlist=["maybe_write_model_report"]).maybe_write_model_report(
+    return importlib.import_module(".models", __package__).maybe_write_model_report(
         ai_dir,
         reasoner,
         prompt,
@@ -290,7 +291,7 @@ def run_plan_generation(
     goals_text: str,
     args,
 ) -> Tuple[str, Dict[str, Any]]:
-    return __import__("molde_maestro.models", fromlist=["run_plan_generation"]).run_plan_generation(
+    return importlib.import_module(".models", __package__).run_plan_generation(
         repo,
         ai_dir,
         goals_text,
@@ -319,7 +320,7 @@ def write_test_report(
     semantic_validation_timeout: int = 60,
     validation_plan: Optional[ValidationPlan] = None,
 ) -> Tuple[bool, str, Dict[str, Any]]:
-    return __import__("molde_maestro.validation", fromlist=["write_test_report"]).write_test_report(
+    return importlib.import_module(".validation", __package__).write_test_report(
         repo,
         ai_dir,
         lint_cmd,
@@ -725,6 +726,7 @@ def build_grounded_final_report(
     test_report_md: str,
     changed_files: List[str],
     git_diff: str,
+    validation_command: Optional[str] = None,
 ) -> str:
     stage_status = {stage["name"]: stage.get("status", "unknown") for stage in metadata.get("stages", [])}
     stage_lines = [
@@ -751,6 +753,7 @@ def build_grounded_final_report(
     runner_line = "- Runner not recorded."
     semantic_alert = False
     if test_report_md.strip():
+        command_match = re.search(r"Command:\n```bash\n(.+?)\n```", test_report_md, re.DOTALL)
         match = re.search(r"- stage_status: \*\*(.+?)\*\*", test_report_md)
         semantic_match = re.search(r"- semantic_validation_status: \*\*(.+?)\*\*", test_report_md)
         profile_match = re.search(r"- validation_profile: \*\*(.+?)\*\*", test_report_md)
@@ -773,6 +776,13 @@ def build_grounded_final_report(
         checks = re.findall(r"- L(\d+) `([^`]+)`: \*\*(.+?)\*\* blocking=(True|False)", test_report_md)
         if checks:
             checks_line = "- Validation checks: " + "; ".join(f"L{level} {name}={status}" for level, name, status, _ in checks[:6]) + "."
+        if command_match:
+            validation_command = command_match.group(1).strip()
+    validation_evidence_line = (
+        f"- Current validation only proves the repo still compiles under `{validation_command}`."
+        if validation_command
+        else "- Current validation evidence is limited; inspect AI/test-report.md for the exact executed command."
+    )
     diff_excerpt = truncate(git_diff.strip(), 4000) if git_diff.strip() else "[No git diff recorded]"
     return "\n".join(
         [
@@ -799,7 +809,7 @@ def build_grounded_final_report(
             promotion_line,
             runner_line,
             checks_line,
-            "- Current validation only proves the repo still compiles under `python3 -m compileall src main.py`.",
+            validation_evidence_line,
             "",
             "## Risks and Regressions",
             "- This report is grounded on metadata and git diff to avoid hallucinated success claims.",

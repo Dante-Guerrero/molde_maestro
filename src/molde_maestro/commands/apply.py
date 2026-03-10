@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from .. import pipeline as core
 from ..command_config import ApplyCommandConfig
@@ -8,8 +9,9 @@ from ..command_config import ApplyCommandConfig
 
 def cmd_apply(args) -> None:
     config = ApplyCommandConfig.from_args(args)
-    repo, ai_dir, recorder = core.init_run_context(config._raw_args)
+    repo = Path(config.repo).expanduser().resolve()
     core.preflight(config._raw_args, repo)
+    repo, ai_dir, recorder = core.init_run_context(config._raw_args)
 
     core.require_nonempty(config.aider_model, "aider_model", "Config: aider_model: 'ollama:qwen3-coder:14b'")
 

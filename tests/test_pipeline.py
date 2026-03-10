@@ -534,6 +534,24 @@ class RunRecorderTests(unittest.TestCase):
         self.assertNotIn("src/exam_pipeline/preprocess.py", report)
         self.assertIn("grounded on metadata and git diff", report)
 
+    def test_build_grounded_final_report_uses_executed_validation_command(self) -> None:
+        metadata = {
+            "status": "ok",
+            "stages": [
+                {"name": "apply", "status": "ok", "duration_seconds": 10.0, "details": {"selected_change_titles": ["Fix ingest"], "changed_files": ["src/exam_pipeline/ingest.py"]}},
+                {"name": "test", "status": "ok", "duration_seconds": 1.0, "details": {}},
+            ],
+        }
+        report = pipeline.build_grounded_final_report(
+            metadata,
+            "1) Change: Fix ingest\n   - Files: `src/exam_pipeline/ingest.py`\n",
+            "## Tests\n\nCommand:\n```bash\npython3 -m compileall src\n```\n\n- stage_status: **ok**",
+            ["src/exam_pipeline/ingest.py"],
+            "diff --git a/src/exam_pipeline/ingest.py b/src/exam_pipeline/ingest.py",
+        )
+        self.assertIn("`python3 -m compileall src`", report)
+        self.assertNotIn("compileall src main.py", report)
+
     def test_project_reported_metadata_marks_report_ok(self) -> None:
         metadata = {
             "status": "running",
@@ -547,6 +565,14 @@ class RunRecorderTests(unittest.TestCase):
 
 
 class CommandArtifactTests(unittest.TestCase):
+    def test_ensure_repo_ready_for_aider_ignores_ai_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            (repo / ".git" / "info").mkdir(parents=True)
+            pipeline.ensure_repo_ready_for_aider(repo)
+            exclude = (repo / ".git" / "info" / "exclude").read_text(encoding="utf-8")
+        self.assertIn("AI/", exclude)
+
     def make_plan_args(self, repo: Path) -> argparse.Namespace:
         return argparse.Namespace(
             cmd="plan",

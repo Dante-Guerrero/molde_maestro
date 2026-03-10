@@ -37,6 +37,7 @@ class PlanAttemptSpec:
 
 
 DEFAULT_AIDER_GITIGNORE_PATTERNS = [
+    "AI/",
     ".aider*",
     ".env",
     ".venv/",
@@ -127,13 +128,14 @@ def save_model_artifacts(ai_dir: Path, prefix: str, prompt: str, raw: Optional[s
 
 def ensure_repo_ready_for_aider(repo: Path) -> None:
     gitignore = repo / ".gitignore"
-    existing = read_text(gitignore, default="")
+    target = gitignore if gitignore.exists() else repo / ".git" / "info" / "exclude"
+    existing = read_text(target, default="")
     missing = [p for p in DEFAULT_AIDER_GITIGNORE_PATTERNS if p not in existing]
     if missing:
         parts = [existing.rstrip()] if existing.strip() else []
         parts.append("# Aider / local artifacts")
         parts.extend(missing)
-        safe_write(gitignore, "\n".join(parts).rstrip() + "\n")
+        safe_write(target, "\n".join(parts).rstrip() + "\n")
 
 
 def run_aider(
