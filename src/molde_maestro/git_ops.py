@@ -12,10 +12,39 @@ NOISE_ARTIFACT_SUFFIXES = {".pyc", ".pyo"}
 NOISE_ARTIFACT_DIRS = {"__pycache__"}
 
 
-def ensure_git_repo(repo: Path) -> None:
+def is_git_repo(repo: Path) -> bool:
     code, out, _ = run_cmd("git rev-parse --is-inside-work-tree", cwd=repo)
-    if code != 0 or out.strip() != "true":
+    return code == 0 and out.strip() == "true"
+
+
+def ensure_git_repo(repo: Path) -> None:
+    if not is_git_repo(repo):
         raise SystemExit(f"No es un repo git válido: {repo}")
+
+
+def git_init(repo: Path) -> None:
+    run_cmd(["git", "init"], cwd=repo, check=True)
+
+
+def git_init_with_initial_commit(repo: Path, message: str = "chore: initialize repository") -> str:
+    git_init(repo)
+    run_cmd(["git", "add", "-A"], cwd=repo, check=True)
+    run_cmd(
+        [
+            "git",
+            "-c",
+            "user.name=Molde Maestro",
+            "-c",
+            "user.email=molde-maestro@local",
+            "commit",
+            "--allow-empty",
+            "-m",
+            message,
+        ],
+        cwd=repo,
+        check=True,
+    )
+    return git_head_commit(repo)
 
 
 def git_current_branch(repo: Path) -> str:
@@ -26,6 +55,20 @@ def git_current_branch(repo: Path) -> str:
 def git_head_commit(repo: Path) -> str:
     _, out, _ = run_cmd("git rev-parse HEAD", cwd=repo, check=True)
     return out.strip()
+
+
+def git_commit_all(repo: Path, message: str) -> str:
+    run_cmd(["git", "add", "-A"], cwd=repo, check=True)
+    run_cmd(["git", "commit", "-m", message], cwd=repo, check=True)
+    return git_head_commit(repo)
+
+
+def git_commit_paths(repo: Path, message: str, paths: list[str]) -> str:
+    if not paths:
+        raise ValueError("git_commit_paths requiere al menos una ruta.")
+    run_cmd(["git", "add", "-A", "--", *paths], cwd=repo, check=True)
+    run_cmd(["git", "commit", "-m", message], cwd=repo, check=True)
+    return git_head_commit(repo)
 
 
 def git_changed_files_between(repo: Path, base_ref: str, head_ref: str = "HEAD") -> list[str]:
@@ -46,6 +89,10 @@ def git_create_branch(repo: Path, branch_name: str) -> None:
 def git_status_porcelain(repo: Path) -> str:
     _, out, _ = run_cmd("git status --porcelain", cwd=repo)
     return out.strip()
+
+
+def git_has_working_tree_changes(repo: Path) -> bool:
+    return bool(git_status_porcelain(repo))
 
 
 def is_noise_artifact_path(path: str) -> bool:
@@ -112,7 +159,6 @@ def cleanup_tracked_noise_artifacts(repo: Path, commit_message: str = "chore: re
     if not tracked_noise:
         return []
     run_cmd(["git", "rm", "-f", "--", *tracked_noise], cwd=repo, check=True)
-    run_cmd(["git", "commit", "-m", commit_message], cwd=repo, check=True)
     return tracked_noise
 
 
@@ -148,7 +194,9 @@ def infer_base_ref(repo: Path) -> str:
         code2, out2, _ = run_cmd(f"git merge-base HEAD {shlex.quote(upstream)}", cwd=repo)
         if code2 == 0 and out2.strip():
             return out2.strip()
-    return "HEAD~1"
+    if git_ref_exists(repo, "HEAD~1"):
+        return "HEAD~1"
+    return "HEAD"
 
 
 def collect_git_diff(repo: Path, base_ref: str) -> str:
@@ -163,6 +211,30 @@ def collect_git_changed_files(repo: Path, base_ref: str) -> list[str]:
     if code != 0:
         return []
     return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def collect_working_tree_changed_files(repo: Path) -> list[str]:
+    changed: list[str] = []
+    seen: set[str] = set()
+    for _status, path in git_status_entries(repo):
+        if path and path not in seen:
+            seen.add(path)
+            changed.append(path)
+    return changed
+
+
+def collect_working_tree_diff(repo: Path) -> str:
+    chunks: list[str] = []
+    for cmd in (["git", "diff", "--cached", "HEAD"], ["git", "diff", "HEAD"]):
+        code, out, err = run_cmd(cmd, cwd=repo, capture=True)
+        if code == 0 and out.strip():
+            chunks.append(out.strip())
+        elif code != 0 and err.strip():
+            chunks.append(f"[git diff failed]\n{err.strip()}")
+    untracked = [path for status, path in git_status_entries(repo) if status == "??"]
+    if untracked:
+        chunks.append("Untracked files:\n" + "\n".join(untracked))
+    return truncate("\n\n".join(chunk for chunk in chunks if chunk).strip(), 20000)
 
 
 def infer_validation_changed_files(repo: Path, args) -> tuple[list[str], str]:

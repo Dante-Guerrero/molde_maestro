@@ -12,8 +12,7 @@ def cmd_plan(args) -> None:
     core.preflight(config._raw_args, repo)
 
     core.require_nonempty(config.reasoner, "reasoner", "Config: reasoner: 'ollama:deepseek-r1'")
-    goals_path = core.resolve_goals_path(repo, config.goals)
-    goals_text = core.read_text(goals_path, default="# PROJECT_GOALS.md\n\n[Missing goals file]\n")
+    goals_input = core.resolve_goals_input(repo, ai_dir, config._raw_args)
 
     plan_out = Path(config.plan_out).expanduser() if config.plan_out else ai_dir / "plan.md"
     if not plan_out.is_absolute():
@@ -21,13 +20,15 @@ def cmd_plan(args) -> None:
 
     try:
         with core.record_stage(recorder, "plan") as details:
-            plan_md, plan_meta = core.run_plan_generation(repo, ai_dir, goals_text, config._raw_args)
+            plan_md, plan_meta = core.run_plan_generation(repo, ai_dir, goals_input.text, config._raw_args)
             if plan_out != ai_dir / "plan.md":
                 core.safe_write(plan_out, plan_md)
             details["artifact"] = str(plan_out)
             details["prompt_path"] = str(ai_dir / "plan-prompt.txt")
             details["raw_path"] = str(ai_dir / "plan-raw.txt")
             details["sanitized_path"] = str(plan_out)
+            details["goals_source"] = goals_input.source
+            details["goals_path"] = goals_input.path
             details.update(plan_meta)
             print(f"plan: wrote {plan_out}")
     except BaseException as exc:

@@ -40,6 +40,53 @@ class NormalizeModelMarkdownTests(unittest.TestCase):
         )
 
 
+class CliInteractionTests(unittest.TestCase):
+    @mock.patch("sys.stdin.isatty", return_value=True)
+    @mock.patch("builtins.input", side_effect=["2"])
+    @mock.patch("molde_maestro.cli._list_ollama_models", return_value=["deepseek-r1", "qwen2.5-coder:14b"])
+    def test_complete_interactive_args_selects_missing_models_by_number(
+        self,
+        _mock_models: mock.Mock,
+        _mock_input: mock.Mock,
+        _mock_isatty: mock.Mock,
+    ) -> None:
+        args = argparse.Namespace(
+            cmd="plan",
+            repo=".",
+            goals="PROJECT_GOALS.md",
+            goals_text="already set",
+            reasoner="",
+            aider_model="",
+        )
+
+        resolved = pipeline.cli_module.complete_interactive_args(args)
+
+        self.assertEqual(resolved.reasoner, "ollama:qwen2.5-coder:14b")
+
+    @mock.patch("sys.stdin.isatty", return_value=True)
+    @mock.patch("builtins.input", side_effect=["Implementa cambio A", "END"])
+    def test_complete_interactive_args_collects_goals_when_file_is_missing(
+        self,
+        _mock_input: mock.Mock,
+        _mock_isatty: mock.Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = argparse.Namespace(
+                cmd="plan",
+                repo=tmpdir,
+                goals="PROJECT_GOALS.md",
+                goals_text="",
+                reasoner="ollama:deepseek-r1",
+                aider_model="",
+                _interactive_goals_text=False,
+            )
+
+            resolved = pipeline.cli_module.complete_interactive_args(args)
+
+            self.assertEqual(resolved.goals_text, "Implementa cambio A")
+            self.assertTrue(resolved._interactive_goals_text)
+
+
 class LoadConfigFileTests(unittest.TestCase):
     @mock.patch.dict(sys.modules, {"yaml": None})
     def test_ignores_auto_yaml_when_pyyaml_is_missing(self) -> None:
@@ -71,6 +118,7 @@ class PreflightTests(unittest.TestCase):
             plan_retry_on_timeout=False,
             aider_model="ollama:qwen2.5-coder:14b",
             goals="PROJECT_GOALS.md",
+            goals_text="",
             test_cmd="python3 -m compileall src",
             lint_cmd="",
             allow_dirty_repo=False,
@@ -78,12 +126,12 @@ class PreflightTests(unittest.TestCase):
 
     @mock.patch("molde_maestro.pipeline.git_status_porcelain", return_value="")
     @mock.patch("molde_maestro.pipeline.command_exists", return_value=True)
-    @mock.patch("molde_maestro.pipeline.ensure_git_repo")
+    @mock.patch("molde_maestro.pipeline.ensure_git_repo_ready")
     @mock.patch("molde_maestro.pipeline.validate_model_available")
     def test_plan_only_validates_reasoner(
         self,
         mock_validate: mock.Mock,
-        _mock_repo: mock.Mock,
+        _mock_git_ready: mock.Mock,
         _mock_exists: mock.Mock,
         _mock_status: mock.Mock,
     ) -> None:
@@ -98,12 +146,12 @@ class PreflightTests(unittest.TestCase):
     @mock.patch("molde_maestro.pipeline.untracked_noise_artifacts", return_value=[])
     @mock.patch("molde_maestro.pipeline.cleanup_untracked_noise_artifacts", return_value=[])
     @mock.patch("molde_maestro.pipeline.command_exists", return_value=True)
-    @mock.patch("molde_maestro.pipeline.ensure_git_repo")
+    @mock.patch("molde_maestro.pipeline.ensure_git_repo_ready")
     @mock.patch("molde_maestro.pipeline.validate_model_available")
     def test_apply_only_validates_aider_model(
         self,
         mock_validate: mock.Mock,
-        _mock_repo: mock.Mock,
+        _mock_git_ready: mock.Mock,
         _mock_exists: mock.Mock,
         _mock_cleanup: mock.Mock,
         _mock_untracked: mock.Mock,
@@ -119,10 +167,8 @@ class PreflightTests(unittest.TestCase):
     @mock.patch("builtins.input", return_value="y")
     @mock.patch("molde_maestro.pipeline.validate_model_available")
     @mock.patch("molde_maestro.pipeline.command_exists", return_value=True)
-    @mock.patch("molde_maestro.pipeline.ensure_git_repo")
     def test_preflight_auto_cleans_untracked_noise_before_dirty_check(
         self,
-        _mock_repo: mock.Mock,
         _mock_exists: mock.Mock,
         _mock_validate: mock.Mock,
         _mock_input: mock.Mock,
@@ -152,10 +198,8 @@ class PreflightTests(unittest.TestCase):
     @mock.patch("builtins.input", return_value="n")
     @mock.patch("molde_maestro.pipeline.validate_model_available")
     @mock.patch("molde_maestro.pipeline.command_exists", return_value=True)
-    @mock.patch("molde_maestro.pipeline.ensure_git_repo")
     def test_preflight_keeps_noise_when_user_rejects_cleanup(
         self,
-        _mock_repo: mock.Mock,
         _mock_exists: mock.Mock,
         _mock_validate: mock.Mock,
         _mock_input: mock.Mock,
@@ -174,19 +218,14 @@ class PreflightTests(unittest.TestCase):
             args = self.make_args("apply")
             args.repo = str(repo)
 
-            with self.assertRaises(SystemExit) as exc:
-                pipeline.preflight(args, repo)
-
-            self.assertIn("cambios sin commit", str(exc.exception))
+            pipeline.preflight(args, repo)
             self.assertTrue((repo / ".DS_Store").exists())
 
     @mock.patch("sys.stdin.isatty", return_value=False)
     @mock.patch("molde_maestro.pipeline.validate_model_available")
     @mock.patch("molde_maestro.pipeline.command_exists", return_value=True)
-    @mock.patch("molde_maestro.pipeline.ensure_git_repo")
     def test_preflight_fails_if_cleanup_is_needed_but_session_is_not_interactive(
         self,
-        _mock_repo: mock.Mock,
         _mock_exists: mock.Mock,
         _mock_validate: mock.Mock,
         _mock_isatty: mock.Mock,
@@ -209,6 +248,27 @@ class PreflightTests(unittest.TestCase):
 
             self.assertIn("no es interactiva", str(exc.exception))
 
+    @mock.patch("sys.stdin.isatty", return_value=True)
+    @mock.patch("builtins.input", return_value="y")
+    @mock.patch("molde_maestro.pipeline.validate_model_available")
+    @mock.patch("molde_maestro.pipeline.command_exists", return_value=True)
+    def test_preflight_offers_git_init_when_repo_has_no_git(
+        self,
+        _mock_exists: mock.Mock,
+        _mock_validate: mock.Mock,
+        _mock_input: mock.Mock,
+        _mock_isatty: mock.Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            (repo / "PROJECT_GOALS.md").write_text("- goal\n", encoding="utf-8")
+            args = self.make_args("plan")
+            args.repo = str(repo)
+
+            pipeline.preflight(args, repo)
+
+            self.assertTrue((repo / ".git").exists())
+
 
 class MergeConfigTests(unittest.TestCase):
     def test_merges_timeout_values_from_config(self) -> None:
@@ -228,6 +288,7 @@ class MergeConfigTests(unittest.TestCase):
             "apply_enforce_plan_scope": True,
             "apply_skip_unsupported_plan_changes": True,
             "validation_profile": "python_local",
+            "goals_text": "- inline goal",
             "semantic_validation": True,
             "semantic_validation_mode": "ast",
             "semantic_validation_strict": True,
@@ -247,6 +308,7 @@ class MergeConfigTests(unittest.TestCase):
         self.assertTrue(merged.apply_enforce_plan_scope)
         self.assertTrue(merged.apply_skip_unsupported_plan_changes)
         self.assertEqual(merged.validation_profile, "python_local")
+        self.assertEqual(merged.goals_text, "- inline goal")
         self.assertTrue(merged.semantic_validation)
         self.assertEqual(merged.semantic_validation_mode, "ast")
         self.assertTrue(merged.semantic_validation_strict)
@@ -308,6 +370,19 @@ class PlanStrategyTests(unittest.TestCase):
         self.assertEqual(attempts[-1].reasoner, "ollama:qwen2.5-coder:7b")
         self.assertEqual(attempts[-1].timeout, 45)
 
+    def test_build_plan_attempt_specs_adds_fallback_without_retry_flag(self) -> None:
+        attempts = pipeline.build_plan_attempt_specs(
+            self.make_args(
+                plan_mode="balanced",
+                plan_retry_on_timeout=False,
+                plan_fallback_reasoner="ollama:qwen2.5-coder:7b",
+                plan_fallback_timeout=45,
+            )
+        )
+        self.assertEqual([a.label for a in attempts], ["primary", "fallback-fast"])
+        self.assertEqual(attempts[-1].reasoner, "ollama:qwen2.5-coder:7b")
+        self.assertEqual(attempts[-1].timeout, 45)
+
     def test_build_reasoner_prompt_includes_allowed_validation_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -322,6 +397,56 @@ class PlanStrategyTests(unittest.TestCase):
             )
             self.assertIn("ALLOWED VALIDATION COMMANDS", prompt)
             self.assertIn("python3 -m compileall src main.py", prompt)
+
+
+class GoalsResolutionTests(unittest.TestCase):
+    def test_resolve_goals_input_prefers_inline_text_and_persists_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            ai_dir = repo / "AI"
+            args = argparse.Namespace(goals="PROJECT_GOALS.md", goals_text="- inline\n", _interactive_goals_text=True)
+
+            resolved = pipeline.resolve_goals_input(repo, ai_dir, args)
+
+            self.assertEqual(resolved.source, "interactive_input")
+            self.assertEqual(resolved.text, "- inline")
+            self.assertTrue((ai_dir / "session-goals.md").exists())
+            self.assertEqual((ai_dir / "session-goals.md").read_text(encoding="utf-8"), "- inline\n")
+
+    def test_resolve_goals_input_reads_file_when_inline_text_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            ai_dir = repo / "AI"
+            (repo / "PROJECT_GOALS.md").write_text("- file goal\n", encoding="utf-8")
+            args = argparse.Namespace(goals="PROJECT_GOALS.md", goals_text="", _interactive_goals_text=False)
+
+            resolved = pipeline.resolve_goals_input(repo, ai_dir, args)
+
+            self.assertEqual(resolved.source, "file")
+            self.assertEqual(resolved.text, "- file goal\n")
+            self.assertFalse((ai_dir / "session-goals.md").exists())
+
+    def test_filter_user_visible_paths_excludes_ai_artifacts(self) -> None:
+        filtered = pipeline.filter_user_visible_paths(["AI/run-metadata.json", "src/app.py", "AI/final.md"], "AI")
+        self.assertEqual(filtered, ["src/app.py"])
+
+    def test_collect_report_context_prefers_apply_stage_files_over_ai_metadata(self) -> None:
+        metadata = {
+            "stages": [
+                {
+                    "name": "apply",
+                    "details": {
+                        "changed_files": ["src/app.py"],
+                        "head_before_apply": "HEAD~1",
+                    },
+                }
+            ]
+        }
+        with mock.patch("molde_maestro.pipeline.collect_git_diff", return_value="diff --git a/src/app.py b/src/app.py") as diff_mock:
+            changed_files, git_diff = pipeline.collect_report_context(Path("/tmp/repo"), "HEAD", metadata, "AI")
+        self.assertEqual(changed_files, ["src/app.py"])
+        self.assertEqual(git_diff, "diff --git a/src/app.py b/src/app.py")
+        diff_mock.assert_called_once_with(Path("/tmp/repo"), "HEAD~1")
 
 
 class ApplyScopeTests(unittest.TestCase):
@@ -514,6 +639,18 @@ class ValidationProfileTests(unittest.TestCase):
         self.assertEqual(base_ref, "HEAD~1")
         self.assertEqual(changed, ["src/pkg/mod.py"])
 
+    def test_infer_base_ref_returns_head_for_single_commit_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            pipeline.run_cmd(["git", "init"], cwd=repo, check=True)
+            pipeline.run_cmd(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+            pipeline.run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+            (repo / "README.md").write_text("hello\n", encoding="utf-8")
+            pipeline.run_cmd(["git", "add", "."], cwd=repo, check=True)
+            pipeline.run_cmd(["git", "commit", "-m", "initial"], cwd=repo, check=True)
+
+            self.assertEqual(pipeline.infer_base_ref(repo), "HEAD")
+
     def test_validation_plan_to_dict_exposes_runner_and_promotion(self) -> None:
         context = pipeline.ValidationContext(
             is_python_repo=True,
@@ -684,7 +821,7 @@ class CommandArtifactTests(unittest.TestCase):
         self.assertIn("AI/", exclude)
         self.assertIn(".DS_Store", exclude)
 
-    def test_cleanup_tracked_noise_artifacts_removes_and_commits_generated_files(self) -> None:
+    def test_cleanup_tracked_noise_artifacts_removes_and_stages_generated_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
             pipeline.run_cmd(["git", "init"], cwd=repo, check=True)
@@ -698,17 +835,34 @@ class CommandArtifactTests(unittest.TestCase):
 
             pipeline.run_cmd(["git", "add", "."], cwd=repo, check=True)
             pipeline.run_cmd(["git", "commit", "-m", "initial"], cwd=repo, check=True)
-            before_head = pipeline.git_head_commit(repo)
 
             removed = pipeline.cleanup_tracked_noise_artifacts(repo)
-            after_head = pipeline.git_head_commit(repo)
 
             self.assertEqual(removed, ["src/calculator/__pycache__/core.cpython-314.pyc"])
-            self.assertNotEqual(before_head, after_head)
             self.assertFalse(tracked_noise.exists())
             code, tracked_after, _ = pipeline.run_cmd(["git", "ls-files"], cwd=repo, capture=True)
             self.assertEqual(code, 0)
             self.assertNotIn("src/calculator/__pycache__/core.cpython-314.pyc", tracked_after.splitlines())
+            self.assertIn("D  src/calculator/__pycache__/core.cpython-314.pyc", pipeline.git_status_porcelain(repo))
+
+    def test_ensure_repo_ready_for_apply_session_commits_existing_changes_when_user_accepts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            pipeline.run_cmd(["git", "init"], cwd=repo, check=True)
+            pipeline.run_cmd(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+            pipeline.run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+            (repo / "README.md").write_text("hello\n", encoding="utf-8")
+            pipeline.run_cmd(["git", "add", "."], cwd=repo, check=True)
+            pipeline.run_cmd(["git", "commit", "-m", "initial"], cwd=repo, check=True)
+            (repo / "README.md").write_text("changed\n", encoding="utf-8")
+            args = argparse.Namespace(allow_dirty_repo=False)
+
+            with mock.patch("sys.stdin.isatty", return_value=True):
+                with mock.patch("builtins.input", return_value="y"):
+                    result = pipeline.ensure_repo_ready_for_apply_session(repo, args, tracked_noise=[])
+
+            self.assertIsNotNone(result["preexisting_commit"])
+            self.assertEqual(pipeline.git_status_porcelain(repo), "")
 
     @mock.patch("sys.stdin.isatty", return_value=True)
     @mock.patch("builtins.input", return_value="y")
@@ -738,10 +892,12 @@ class CommandArtifactTests(unittest.TestCase):
             plan_fallback_reasoner="",
             plan_fallback_timeout=0,
             goals="PROJECT_GOALS.md",
+            goals_text="",
             extra_context=[],
             plan_out="",
             test_cmd="python3 -m compileall src main.py",
             lint_cmd="",
+            _interactive_goals_text=False,
             _config_path=None,
         )
 
@@ -833,6 +989,47 @@ class CommandArtifactTests(unittest.TestCase):
 
     @mock.patch("molde_maestro.pipeline.preflight")
     @mock.patch("molde_maestro.pipeline.call_model")
+    def test_cmd_plan_uses_fallback_reasoner_without_retry_flag(
+        self,
+        mock_call_model: mock.Mock,
+        _mock_preflight: mock.Mock,
+    ) -> None:
+        mock_call_model.side_effect = [
+            pipeline.ExecutionFailure("slow", status="timeout", timeout_seconds=5, stdout="thinking"),
+            "# Repo Review Plan\n\n## Summary\n- fallback\n",
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            (repo / "PROJECT_GOALS.md").write_text("- meta\n", encoding="utf-8")
+            args = self.make_plan_args(repo)
+            args.plan_fallback_reasoner = "ollama:qwen2.5-coder:7b"
+
+            pipeline.cmd_plan(args)
+
+            ai_dir = repo / "AI"
+            attempts = json.loads((ai_dir / "plan-attempts.json").read_text(encoding="utf-8"))
+            self.assertEqual([attempt["label"] for attempt in attempts], ["primary", "fallback-fast"])
+            self.assertEqual(attempts[1]["reasoner"], "ollama:qwen2.5-coder:7b")
+
+    @mock.patch("molde_maestro.pipeline.preflight")
+    @mock.patch("molde_maestro.pipeline.call_model", return_value="# Repo Review Plan\n\n## Summary\n- ok\n")
+    def test_cmd_plan_persists_inline_goals_to_ai_directory(
+        self,
+        _mock_call_model: mock.Mock,
+        _mock_preflight: mock.Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            args = self.make_plan_args(repo)
+            args.goals_text = "- inline goal"
+            args._interactive_goals_text = True
+
+            pipeline.cmd_plan(args)
+
+            self.assertEqual((repo / "AI" / "session-goals.md").read_text(encoding="utf-8"), "- inline goal\n")
+
+    @mock.patch("molde_maestro.pipeline.preflight")
+    @mock.patch("molde_maestro.pipeline.call_model")
     def test_cmd_report_writes_grounded_report_when_model_fails(
         self,
         mock_call_model: mock.Mock,
@@ -870,6 +1067,37 @@ class CommandArtifactTests(unittest.TestCase):
             report_stage = metadata["stages"][0]
             self.assertEqual(report_stage["details"]["model_summary_status"], "failed")
             self.assertTrue((ai_dir / "report-model-error.md").exists())
+
+    @mock.patch("molde_maestro.pipeline.preflight")
+    def test_cmd_report_preserves_pipeline_status_from_run_metadata(self, _mock_preflight: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            ai_dir = repo / "AI"
+            ai_dir.mkdir()
+            (repo / "PROJECT_GOALS.md").write_text("- keep stable\n", encoding="utf-8")
+            (ai_dir / "plan.md").write_text("# Repo Review Plan\n\n1) Change: Fix foo\n", encoding="utf-8")
+            (ai_dir / "test-report.md").write_text("- stage_status: **failed**\n", encoding="utf-8")
+            (ai_dir / "run-metadata.json").write_text(json.dumps({"status": "failed", "stages": []}), encoding="utf-8")
+            args = argparse.Namespace(
+                repo=str(repo),
+                ai_dir="AI",
+                cmd="report",
+                goals="PROJECT_GOALS.md",
+                goals_text="",
+                reasoner="",
+                base_ref="HEAD",
+                report_timeout=15,
+                reasoner_timeout=15,
+                _interactive_goals_text=False,
+                _config_path=None,
+            )
+
+            with mock.patch("molde_maestro.pipeline.collect_report_context", return_value=(["src/foo.py"], "diff --git a/src/foo.py b/src/foo.py")) as context_mock:
+                    pipeline.cmd_report(args)
+
+            final_md = (ai_dir / "final.md").read_text(encoding="utf-8")
+            self.assertIn("- Overall status: **failed**.", final_md)
+            context_mock.assert_called_once()
 
     @mock.patch("molde_maestro.pipeline.preflight")
     @mock.patch("molde_maestro.pipeline.call_model", return_value="# Final Report\n\nModel summary\n")

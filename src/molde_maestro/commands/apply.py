@@ -23,14 +23,8 @@ def cmd_apply(args) -> None:
     try:
         with core.record_stage(recorder, "apply") as details:
             core.clear_artifacts(ai_dir, ["aider-log.txt", "aider-message.txt", "apply-error.md", "apply-scope.json", "apply-selected-plan.md"])
-            base = core.resolve_base_branch(repo, config.base)
-            branch = config.branch.strip() or f"ai/{core.now_stamp()}-improvements"
-            core.git_checkout(repo, base)
-            core.git_create_branch(repo, branch)
-            tracked_noise = core.tracked_noise_files(repo)
-            cleaned_noise_files: list[str] = []
-            if tracked_noise and core.confirm_noise_cleanup(repo, "tracked", tracked_noise):
-                cleaned_noise_files = core.cleanup_tracked_noise_artifacts(repo)
+            active_branch = core.git_current_branch(repo)
+            prep = core.ensure_repo_ready_for_apply_session(repo, config._raw_args)
             pre_apply_head = core.git_head_commit(repo)
 
             core.ensure_repo_ready_for_aider(repo)
@@ -71,8 +65,7 @@ def cmd_apply(args) -> None:
                 extra_args=config.aider_extra_args,
                 timeout=config.aider_timeout,
             )
-            details["base"] = base
-            details["branch"] = branch
+            details["active_branch"] = active_branch
             details["log_path"] = str(log_path)
             details["aider_timeout"] = config.aider_timeout
             details["apply_scope_path"] = str(ai_dir / "apply-scope.json")
@@ -81,7 +74,8 @@ def cmd_apply(args) -> None:
             details["selected_files"] = apply_scope.selected_files
             details["selected_change_titles"] = [change.title for change in apply_scope.selected_changes]
             details["skipped_change_titles"] = apply_scope.skipped_change_titles
-            details["cleaned_tracked_noise_files"] = cleaned_noise_files
+            details["cleaned_tracked_noise_files"] = prep["cleaned_tracked_noise_files"]
+            details["preexisting_commit"] = prep["preexisting_commit"]
             details["stdout_excerpt"] = core.truncate(stdout, 2000)
             if rc != 0 or core.aider_output_has_fatal_error(stdout, err):
                 raise core.ExecutionFailure(
@@ -92,11 +86,15 @@ def cmd_apply(args) -> None:
                     stderr=err,
                     status="failed",
                 )
-            post_apply_head = core.git_head_commit(repo)
-            changed_files = core.git_changed_files_between(repo, pre_apply_head, post_apply_head)
-            if post_apply_head == pre_apply_head or not changed_files or set(changed_files) <= {".gitignore"}:
+            aider_result = core.collect_aider_result(repo, pre_apply_head)
+            changed_files = aider_result["changed_files"]
+            details["aider_result_mode"] = aider_result["mode"]
+            details["aider_commit_created"] = aider_result["commit_created"]
+            details["head_before_apply"] = aider_result["head_before"]
+            details["head_after_apply"] = aider_result["head_after"]
+            if not changed_files or set(changed_files) <= {".gitignore"}:
                 raise core.ExecutionFailure(
-                    "Aider completed without producing a meaningful committed change.",
+                    "Aider completed without producing a meaningful change.",
                     command=f"aider --model {core.normalize_aider_model_name(config.aider_model)}",
                     stdout=stdout,
                     stderr=err,
@@ -124,12 +122,17 @@ def cmd_apply(args) -> None:
                 )
             details["changed_files"] = changed_files
             print(f"apply: aider return code = {rc}")
-
-            dirty = core.git_status_porcelain(repo)
-            details["dirty_after_apply"] = bool(dirty)
-            if dirty:
-                print("apply: el repo tiene cambios sin commit. Revisa si Aider dejó algo sin auto-commit.")
-                print(dirty)
+            print(core.explain_completed_changes(details["selected_change_titles"], changed_files))
+            commit_sha = None
+            if not aider_result["commit_created"]:
+                commit_sha = core.confirm_and_commit_changes(
+                    repo,
+                    "El plan fue aplicado sobre la rama activa.",
+                    core.generated_commit_message("feat", details["selected_change_titles"]),
+                    changed_files,
+                )
+            details["result_commit"] = commit_sha
+            details["dirty_after_apply"] = core.git_has_working_tree_changes(repo)
     except BaseException as exc:
         error_path = core.write_stage_error(ai_dir, "apply", exc, {"aider_timeout": config.aider_timeout})
         recorder.fail_run(

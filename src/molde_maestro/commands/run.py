@@ -26,14 +26,16 @@ def cmd_run(args) -> None:
     else:
         recorder.mark_stage_skipped("snapshot", "zip_disabled")
 
-    goals_path = core.resolve_goals_path(repo, config.goals)
-    goals_text = core.read_text(goals_path, default="# PROJECT_GOALS.md\n\n[Missing goals file]\n")
+    goals_input = core.resolve_goals_input(repo, ai_dir, config._raw_args)
+    goals_text = goals_input.text
     try:
         with core.record_stage(recorder, "plan") as details:
             plan_md, plan_meta = core.run_plan_generation(repo, ai_dir, goals_text, config._raw_args)
             details["artifact"] = str(ai_dir / "plan.md")
             details["prompt_path"] = str(ai_dir / "plan-prompt.txt")
             details["raw_path"] = str(ai_dir / "plan-raw.txt")
+            details["goals_source"] = goals_input.source
+            details["goals_path"] = goals_input.path
             details.update(plan_meta)
             print(f"run: plan -> {ai_dir / 'plan.md'}")
 
@@ -43,21 +45,16 @@ def cmd_run(args) -> None:
         last_feedback = ""
         final_passed = False
         test_summary: dict[str, Any] = {"status": "failed"}
+        final_changed_files: list[str] = []
+        selected_change_titles: list[str] = []
 
         with core.record_stage(recorder, "apply") as details:
             core.clear_artifacts(ai_dir, ["aider-log.txt", "aider-message.txt", "apply-error.md", "apply-scope.json", "apply-selected-plan.md", "test-report.md", "test-report.json", "test-error.md", "final.md", "report-prompt.txt", "report-raw.txt", "report-model.md", "report-error.md"])
-            base = core.resolve_base_branch(repo, config.base)
-            branch = config.branch.strip() or f"ai/{core.now_stamp()}-improvements"
-            core.git_checkout(repo, base)
-            core.git_create_branch(repo, branch)
-            print(f"run: branch -> {branch} (from {base})")
-            tracked_noise = core.tracked_noise_files(repo)
-            cleaned_noise_files: list[str] = []
-            if tracked_noise and core.confirm_noise_cleanup(repo, "tracked", tracked_noise):
-                cleaned_noise_files = core.cleanup_tracked_noise_artifacts(repo)
-            if cleaned_noise_files:
-                print(f"run: cleaned tracked generated artifacts -> {', '.join(cleaned_noise_files)}")
+            active_branch = core.git_current_branch(repo)
+            prep = core.ensure_repo_ready_for_apply_session(repo, config._raw_args)
             pre_apply_head = core.git_head_commit(repo)
+            if prep["cleaned_tracked_noise_files"]:
+                print(f"run: cleaned tracked generated artifacts -> {', '.join(prep['cleaned_tracked_noise_files'])}")
 
             core.ensure_repo_ready_for_aider(repo)
 
@@ -86,17 +83,18 @@ def cmd_run(args) -> None:
                     ensure_ascii=False,
                 ),
             )
-            details["base"] = base
-            details["branch"] = branch
+            selected_change_titles = [change.title for change in apply_scope.selected_changes]
+            details["active_branch"] = active_branch
             details["log_path"] = str(aider_log)
             details["aider_timeout"] = config.aider_timeout
             details["apply_scope_path"] = str(ai_dir / "apply-scope.json")
             details["selected_plan_path"] = str(ai_dir / "apply-selected-plan.md")
             details["apply_scope_source"] = apply_scope.source
             details["selected_files"] = apply_scope.selected_files
-            details["selected_change_titles"] = [change.title for change in apply_scope.selected_changes]
+            details["selected_change_titles"] = selected_change_titles
             details["skipped_change_titles"] = apply_scope.skipped_change_titles
-            details["cleaned_tracked_noise_files"] = cleaned_noise_files
+            details["cleaned_tracked_noise_files"] = prep["cleaned_tracked_noise_files"]
+            details["preexisting_commit"] = prep["preexisting_commit"]
 
             for i in range(1, config.max_iters + 1):
                 msg = aider_msg if i == 1 else (
@@ -121,11 +119,11 @@ def cmd_run(args) -> None:
                         stderr=err,
                         status="failed",
                     )
-                post_apply_head = core.git_head_commit(repo)
-                changed_files = core.git_changed_files_between(repo, pre_apply_head, post_apply_head)
-                if post_apply_head == pre_apply_head or not changed_files or set(changed_files) <= {".gitignore"}:
+                aider_result = core.collect_aider_result(repo, pre_apply_head)
+                changed_files = aider_result["changed_files"]
+                if not changed_files or set(changed_files) <= {".gitignore"}:
                     raise core.ExecutionFailure(
-                        "Aider completed without producing a meaningful committed change.",
+                        "Aider completed without producing a meaningful change.",
                         command=f"aider --model {core.normalize_aider_model_name(config.aider_model)}",
                         stdout=stdout,
                         stderr=err,
@@ -154,6 +152,11 @@ def cmd_run(args) -> None:
                 details["last_iteration"] = i
                 details["stdout_excerpt"] = core.truncate(stdout, 2000)
                 details["changed_files"] = changed_files
+                details["aider_result_mode"] = aider_result["mode"]
+                details["aider_commit_created"] = aider_result["commit_created"]
+                details["head_before_apply"] = aider_result["head_before"]
+                details["head_after_apply"] = aider_result["head_after"]
+                final_changed_files = changed_files
 
                 with core.record_stage(recorder, "test") as test_details:
                     core.clear_artifacts(ai_dir, ["test-report.md", "test-report.json", "test-error.md"])
@@ -183,6 +186,7 @@ def cmd_run(args) -> None:
                     break
 
                 last_feedback = test_report_md
+                pre_apply_head = aider_result["head_after"]
 
         if not (ai_dir / "test-report.md").exists():
             core.safe_write(ai_dir / "test-report.md", "[No test report produced]\n")
@@ -194,8 +198,7 @@ def cmd_run(args) -> None:
         with core.record_stage(recorder, "report") as details:
             core.clear_artifacts(ai_dir, ["final.md", "report-prompt.txt", "report-raw.txt", "report-model.md", "report-error.md"])
             base_ref = core.infer_base_ref(repo)
-            git_diff = core.collect_git_diff(repo, base_ref)
-            changed_files = core.collect_git_changed_files(repo, base_ref)
+            changed_files, git_diff = core.collect_report_context(repo, base_ref, recorder.metadata, config.ai_dir)
             report_prompt = core.build_report_prompt(
                 goals_text,
                 plan_md,
@@ -226,6 +229,20 @@ def cmd_run(args) -> None:
             )
             core.safe_write(ai_dir / "final.md", final_md)
             print(f"run: final -> {ai_dir / 'final.md'} (base_ref={base_ref})")
+
+        print(core.explain_completed_changes(selected_change_titles, final_changed_files, test_summary.get("status")))
+        result_commit = None
+        pending_user_changes = core.filter_user_visible_paths(core.collect_working_tree_changed_files(repo), config.ai_dir)
+        if pending_user_changes:
+            result_commit = core.confirm_and_commit_changes(
+                repo,
+                "La ejecución terminó sobre la rama activa.",
+                core.generated_commit_message("feat", selected_change_titles),
+                pending_user_changes,
+            )
+        recorder.metadata.setdefault("summary", {})
+        recorder.metadata["summary"]["result_commit"] = result_commit
+        recorder.save()
     except BaseException as exc:
         failed_stage = next((stage["name"] for stage in reversed(recorder.metadata["stages"]) if stage["status"] in {"running", "failed", "timeout"}), "run")
         error_path = core.write_stage_error(ai_dir, failed_stage, exc)
@@ -242,12 +259,13 @@ def cmd_run(args) -> None:
 
     final_status = test_summary.get("status", "ok") if final_passed else test_summary.get("status", "failed")
     recorder.complete_run(final_status, {"tests_passed": final_passed, "test_status": test_summary.get("status", "failed"), "validation_profile": validation_plan.profile})
+    report_changed_files, report_diff = core.collect_report_context(repo, core.infer_base_ref(repo), recorder.metadata, config.ai_dir)
     final_md = core.build_grounded_final_report(
         recorder.metadata,
         plan_md,
         core.read_text(ai_dir / "test-report.md"),
-        core.collect_git_changed_files(repo, core.infer_base_ref(repo)),
-        core.collect_git_diff(repo, core.infer_base_ref(repo)),
+        report_changed_files,
+        report_diff,
         validation_command=test_cmd,
     )
     core.safe_write(ai_dir / "final.md", final_md)

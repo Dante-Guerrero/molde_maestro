@@ -78,6 +78,7 @@ def merge_config_into_args(args: argparse.Namespace, cfg: dict) -> argparse.Name
     mappings = {
         "repo": "repo",
         "goals": "goals",
+        "goals_text": "goals_text",
         "ai_dir": "ai_dir",
         "extra_context": "extra_context",
         "max_tree_lines": "max_tree_lines",
@@ -130,6 +131,7 @@ def merge_config_into_args(args: argparse.Namespace, cfg: dict) -> argparse.Name
             default_strings = {
                 "repo": ".",
                 "goals": "PROJECT_GOALS.md",
+                "goals_text": "",
                 "ai_dir": "AI",
                 "plan_mode": "balanced",
                 "plan_fallback_reasoner": "",
@@ -187,6 +189,89 @@ def resolve_config_relative_paths(args: argparse.Namespace, cfg: dict, cfg_path:
     return args
 
 
+def _is_interactive() -> bool:
+    return sys.stdin.isatty()
+
+
+def _list_ollama_models() -> list[str]:
+    try:
+        proc = subprocess.run(
+            ["ollama", "list"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    if proc.returncode != 0:
+        return []
+    models: list[str] = []
+    for line in proc.stdout.splitlines()[1:]:
+        parts = line.split()
+        if parts:
+            models.append(parts[0])
+    return models
+
+
+def _prompt_numbered_model_selection(label: str, models: list[str]) -> str:
+    if not models:
+        raise SystemExit(f"No pude listar modelos de Ollama para seleccionar {label}.")
+    print(f"Selecciona el modelo {label}:")
+    for index, model in enumerate(models, start=1):
+        print(f"{index}. {model}")
+    while True:
+        choice = input("> ").strip()
+        if choice.isdigit():
+            selected = int(choice)
+            if 1 <= selected <= len(models):
+                return f"ollama:{models[selected - 1]}"
+        print(f"Entrada inválida. Ingresa un número entre 1 y {len(models)}.", file=sys.stderr)
+
+
+def _prompt_multiline_goals() -> str:
+    print("No se encontró el archivo de goals. Pega las instrucciones y finaliza con una línea que contenga solo END.")
+    lines: list[str] = []
+    while True:
+        line = input()
+        if line.strip() == "END":
+            break
+        lines.append(line)
+    text = "\n".join(lines).strip()
+    if not text:
+        raise SystemExit("No se ingresaron objetivos para el repositorio.")
+    return text
+
+
+def complete_interactive_args(args: argparse.Namespace) -> argparse.Namespace:
+    if not _is_interactive():
+        return args
+
+    needs_reasoner = args.cmd in {"plan", "run", "report"} and not str(getattr(args, "reasoner", "") or "").strip()
+    needs_aider = args.cmd in {"apply", "run"} and not str(getattr(args, "aider_model", "") or "").strip()
+    needs_goals = args.cmd in {"plan", "report", "run"} and not str(getattr(args, "goals_text", "") or "").strip()
+
+    models: list[str] = []
+    if needs_reasoner or needs_aider:
+        models = _list_ollama_models()
+
+    if needs_reasoner:
+        args.reasoner = _prompt_numbered_model_selection("reasoner", models)
+
+    if needs_aider:
+        args.aider_model = _prompt_numbered_model_selection("para Aider", models)
+
+    if needs_goals:
+        repo = Path(getattr(args, "repo", ".")).expanduser().resolve()
+        goals_value = Path(str(getattr(args, "goals", "PROJECT_GOALS.md") or "PROJECT_GOALS.md")).expanduser()
+        goals_path = goals_value if goals_value.is_absolute() else repo / goals_value
+        if not goals_path.exists():
+            args.goals_text = _prompt_multiline_goals()
+            args._interactive_goals_text = True
+
+    return args
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Repo improvement pipeline (reasoner -> aider -> tests -> final report).",
@@ -199,6 +284,7 @@ def build_parser() -> argparse.ArgumentParser:
     def add_shared(sp):
         sp.add_argument("--repo", default=".", help="Ruta del repo objetivo.")
         sp.add_argument("--goals", default="PROJECT_GOALS.md", help="Archivo de objetivos.")
+        sp.add_argument("--goals-text", default="", help="Texto inline con objetivos. Tiene prioridad sobre --goals.")
         sp.add_argument("--ai-dir", default="AI", help="Directorio de artefactos AI.")
         sp.add_argument("--reasoner", default="", help="Modelo reasoner. Ej: ollama:deepseek-r1")
         sp.add_argument("--plan-mode", default="balanced", help="Estrategia de planning: fast, balanced o deep.")
@@ -297,6 +383,8 @@ def main() -> None:
         args = merge_config_into_args(args, cfg)
         args = resolve_config_relative_paths(args, cfg, cfg_path)
     args._config_path = cfg_path
+    args._interactive_goals_text = False
+    args = complete_interactive_args(args)
 
     try:
         dispatch_command(args)

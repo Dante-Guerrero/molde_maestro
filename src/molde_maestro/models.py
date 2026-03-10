@@ -152,7 +152,6 @@ def run_aider(
     base_cmd = [
         "aider",
         "--model", normalize_aider_model_name(aider_model),
-        "--auto-commits",
         "--yes-always",
         "--no-show-model-warnings",
         "--no-check-model-accepts-settings",
@@ -323,7 +322,7 @@ You MUST follow this plan strictly:
 - Do not introduce unrelated refactors.
 - Do not invent files, tests, scripts or commands that are not already justified by the repo.
 - Do not add new dependencies unless the repo already declares them or the selected scope explicitly requires them.
-- Keep commits small and meaningful (auto-commits is enabled).
+- Leave the repository changes ready for review; do not assume commits will be created automatically.
 
 After completing changes, ensure the repo is left in a runnable state.
 
@@ -472,9 +471,9 @@ def run_plan_generation(
             record["error"] = str(exc)
             attempt_records.append(record)
             safe_write(ai_dir / "plan-attempts.json", json.dumps(attempt_records, indent=2, ensure_ascii=False))
-            retryable = status == "timeout" and args.plan_retry_on_timeout
-            if retryable and attempt.index < len(attempts):
-                print(f"plan: attempt {attempt.index} timed out; degrading strategy.")
+            retryable = status == "timeout" and attempt.index < len(attempts)
+            if retryable:
+                print(f"plan: attempt {attempt.index} timed out; trying next strategy.")
                 continue
             raise
     if last_exc is not None:

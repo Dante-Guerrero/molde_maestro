@@ -40,13 +40,17 @@ from .git_ops import (
     cleanup_untracked_noise_artifacts,
     collect_git_changed_files,
     collect_git_diff,
+    collect_working_tree_changed_files,
+    collect_working_tree_diff,
     ensure_git_repo,
+    git_commit_paths,
     git_archive_zip,
-    git_changed_files_between,
-    git_checkout,
-    git_create_branch,
+    git_commit_all,
     git_current_branch,
+    git_has_working_tree_changes,
     git_head_commit,
+    git_init_with_initial_commit,
+    is_git_repo,
     git_ref_exists,
     git_status_porcelain,
     infer_base_ref,
@@ -158,6 +162,13 @@ PLAN_MODE_PRESETS: Dict[str, Dict[str, int]] = {
 }
 
 
+@dataclasses.dataclass(frozen=True)
+class GoalsInput:
+    text: str
+    source: str
+    path: Optional[str] = None
+
+
 def resolve_plan_settings(args, mode_override: Optional[str] = None) -> PlanSettings:
     mode = (mode_override or args.plan_mode or "balanced").strip().lower()
     if mode not in PLAN_MODE_PRESETS:
@@ -204,18 +215,18 @@ def build_plan_attempt_specs(args) -> List[PlanAttemptSpec]:
             seen.add(degraded)
             next_index += 1
 
-        if args.plan_fallback_reasoner.strip():
-            fallback = ("fast", args.plan_fallback_reasoner.strip())
-            if fallback not in seen:
-                attempts.append(
-                    PlanAttemptSpec(
+    if args.plan_fallback_reasoner.strip():
+        fallback = ("fast", args.plan_fallback_reasoner.strip())
+        if fallback not in seen:
+            attempts.append(
+                PlanAttemptSpec(
                     index=next_index,
                     mode="fast",
                     reasoner=args.plan_fallback_reasoner.strip(),
                     timeout=effective_plan_fallback_timeout(args),
                     label="fallback-fast",
                 )
-                )
+            )
     return attempts
 
 
@@ -253,6 +264,26 @@ def infer_validation_changed_files(repo: Path, args) -> Tuple[List[str], str]:
     )
 
 
+def has_inline_goals(args) -> bool:
+    return bool(str(getattr(args, "goals_text", "") or "").strip())
+
+
+def resolve_goals_input(repo: Path, ai_dir: Path, args) -> GoalsInput:
+    inline_goals = str(getattr(args, "goals_text", "") or "").strip()
+    if inline_goals:
+        session_goals_path = ai_dir / "session-goals.md"
+        safe_write(session_goals_path, inline_goals.rstrip() + "\n")
+        source = "interactive_input" if getattr(args, "_interactive_goals_text", False) else "goals_text"
+        return GoalsInput(text=inline_goals, source=source, path=str(session_goals_path))
+
+    goals_path = resolve_goals_path(repo, getattr(args, "goals", "PROJECT_GOALS.md"))
+    return GoalsInput(
+        text=read_text(goals_path, default="# PROJECT_GOALS.md\n\n[Missing goals file]\n"),
+        source="file",
+        path=str(goals_path),
+    )
+
+
 def confirm_noise_cleanup(repo: Path, label: str, paths: list[str]) -> bool:
     if not paths:
         return False
@@ -268,6 +299,167 @@ def confirm_noise_cleanup(repo: Path, label: str, paths: list[str]) -> bool:
         "¿Quieres limpiarlos ahora? [y/N] "
     ).strip().lower()
     return answer in {"y", "yes"}
+
+
+def format_changed_files_summary(paths: list[str], limit: int = 10) -> str:
+    if not paths:
+        return "(sin archivos)"
+    shown = paths[:limit]
+    body = "\n".join(f"- {path}" for path in shown)
+    if len(paths) > limit:
+        body += f"\n- ... y {len(paths) - limit} más"
+    return body
+
+
+def is_ai_artifact_path(path: str, ai_dir_name: str = "AI") -> bool:
+    normalized = path.strip().lstrip("./")
+    ai_dir_name = (ai_dir_name or "AI").strip("/").lstrip("./") or "AI"
+    return normalized == ai_dir_name or normalized.startswith(f"{ai_dir_name}/")
+
+
+def filter_user_visible_paths(paths: list[str], ai_dir_name: str = "AI") -> list[str]:
+    return [path for path in paths if not is_ai_artifact_path(path, ai_dir_name)]
+
+
+def explain_completed_changes(selected_titles: list[str], changed_files: list[str], test_status: Optional[str] = None) -> str:
+    lines = ["Cambios detectados:"]
+    if selected_titles:
+        lines.append("Cambios planificados aplicados:")
+        lines.extend(f"- {title}" for title in selected_titles)
+    if changed_files:
+        lines.append("Archivos modificados:")
+        lines.extend(f"- {path}" for path in changed_files[:10])
+        if len(changed_files) > 10:
+            lines.append(f"- ... y {len(changed_files) - 10} más")
+    if test_status:
+        lines.append(f"Estado de validación: {test_status}")
+    return "\n".join(lines)
+
+
+def generated_commit_message(prefix: str, selected_titles: list[str]) -> str:
+    if selected_titles:
+        first = re.sub(r"\s+", " ", selected_titles[0].strip().rstrip("."))
+        candidate = f"{prefix}: {first}"
+        return candidate[:72]
+    return f"{prefix}: apply planned changes"
+
+
+def confirm_and_commit_changes(repo: Path, prompt: str, commit_message: str, changed_files: list[str]) -> Optional[str]:
+    if not changed_files or not sys.stdin.isatty():
+        return None
+    print(prompt)
+    print(format_changed_files_summary(changed_files))
+    reply = input("¿Deseas crear un commit? [y/N]: ").strip().lower()
+    if reply not in {"y", "yes", "s", "si"}:
+        return None
+    commit_sha = git_commit_paths(repo, commit_message, changed_files)
+    print(f"git: commit creado -> {commit_sha}")
+    return commit_sha
+
+
+def ensure_repo_ready_for_apply_session(repo: Path, args, *, tracked_noise: Optional[list[str]] = None) -> dict[str, Any]:
+    cleaned_noise_files: list[str] = []
+    tracked_noise = tracked_noise if tracked_noise is not None else tracked_noise_files(repo)
+    if tracked_noise and confirm_noise_cleanup(repo, "tracked", tracked_noise):
+        cleaned_noise_files = cleanup_tracked_noise_artifacts(repo)
+
+    dirty_files = filter_user_visible_paths(collect_working_tree_changed_files(repo), getattr(args, "ai_dir", "AI"))
+    result: dict[str, Any] = {
+        "cleaned_tracked_noise_files": cleaned_noise_files,
+        "preexisting_changed_files": dirty_files,
+        "preexisting_commit": None,
+    }
+    if not dirty_files:
+        return result
+    if getattr(args, "allow_dirty_repo", False):
+        return result
+    if not sys.stdin.isatty():
+        raise SystemExit(
+            "El repo objetivo tiene cambios sin commit y la sesión no es interactiva.\n"
+            "Haz commit/stash primero o activa --allow-dirty-repo."
+        )
+
+    print("Se detectaron cambios antes de aplicar el plan:")
+    print(format_changed_files_summary(dirty_files))
+    commit_sha = confirm_and_commit_changes(
+        repo,
+        "Molde Maestro recomienda guardar el estado actual antes de modificar la rama activa.",
+        "chore: checkpoint before molde_maestro",
+        dirty_files,
+    )
+    if commit_sha is None:
+        raise SystemExit("Operación cancelada para no mezclar cambios previos con los cambios del plan.")
+    result["preexisting_commit"] = commit_sha
+    result["preexisting_changed_files"] = []
+    return result
+
+
+def collect_report_changed_files(repo: Path, base_ref: str) -> list[str]:
+    return filter_user_visible_paths(collect_working_tree_changed_files(repo)) or filter_user_visible_paths(collect_git_changed_files(repo, base_ref))
+
+
+def collect_report_diff(repo: Path, base_ref: str) -> str:
+    return collect_working_tree_diff(repo) or collect_git_diff(repo, base_ref)
+
+
+def extract_apply_stage_details(metadata: dict[str, Any]) -> dict[str, Any]:
+    for stage in metadata.get("stages", []):
+        if stage.get("name") == "apply":
+            return stage.get("details", {})
+    return {}
+
+
+def collect_report_context(repo: Path, base_ref: str, metadata: Optional[dict[str, Any]] = None, ai_dir_name: str = "AI") -> tuple[list[str], str]:
+    metadata = metadata or {}
+    apply_details = extract_apply_stage_details(metadata)
+    apply_changed_files = filter_user_visible_paths(apply_details.get("changed_files") or [], ai_dir_name)
+    if apply_changed_files:
+        apply_base = str(apply_details.get("head_before_apply") or "").strip()
+        if apply_base:
+            return apply_changed_files, collect_git_diff(repo, apply_base)
+        return apply_changed_files, collect_report_diff(repo, base_ref)
+    return collect_report_changed_files(repo, base_ref), collect_report_diff(repo, base_ref)
+
+
+def collect_aider_result(repo: Path, previous_head: str) -> dict[str, Any]:
+    current_head = git_head_commit(repo)
+    working_tree_files = filter_user_visible_paths(collect_working_tree_changed_files(repo))
+    if working_tree_files:
+        return {
+            "mode": "working_tree",
+            "changed_files": working_tree_files,
+            "commit_created": False,
+            "head_before": previous_head,
+            "head_after": current_head,
+        }
+    if current_head != previous_head:
+        committed_files = filter_user_visible_paths(collect_git_changed_files(repo, previous_head))
+        return {
+            "mode": "commit",
+            "changed_files": committed_files,
+            "commit_created": True,
+            "head_before": previous_head,
+            "head_after": current_head,
+        }
+    return {
+        "mode": "none",
+        "changed_files": [],
+        "commit_created": False,
+        "head_before": previous_head,
+        "head_after": current_head,
+    }
+
+
+def ensure_git_repo_ready(repo: Path) -> None:
+    if is_git_repo(repo):
+        return
+    if not sys.stdin.isatty():
+        raise SystemExit(f"No es un repo git válido: {repo}")
+    answer = input(f"El repositorio objetivo no tiene git inicializado ({repo}). ¿Quieres crearlo ahora? [y/N] ").strip().lower()
+    if answer not in {"y", "yes", "s", "si"}:
+        raise SystemExit("Operación cancelada: el repo objetivo no tiene git.")
+    commit_sha = git_init_with_initial_commit(repo)
+    print(f"git: repositorio inicializado -> {commit_sha}")
 
 
 def build_reasoner_prompt(
@@ -859,7 +1051,7 @@ def build_grounded_final_report(
 # -----------------------------
 
 def preflight(args, repo: Path) -> None:
-    ensure_git_repo(repo)
+    ensure_git_repo_ready(repo)
 
     if not command_exists("git"):
         raise SystemExit("No se encontró 'git' en PATH.")
@@ -882,7 +1074,7 @@ def preflight(args, repo: Path) -> None:
 
     if args.cmd in {"plan", "report", "run"}:
         goals_path = resolve_goals_path(repo, args.goals)
-        if not goals_path.exists():
+        if not has_inline_goals(args) and not goals_path.exists():
             raise SystemExit(f"No existe el archivo de goals: {goals_path}")
 
     if args.cmd in {"test", "run"}:
@@ -903,7 +1095,7 @@ def preflight(args, repo: Path) -> None:
         if untracked_noise and confirm_noise_cleanup(repo, "untracked", untracked_noise):
             cleanup_untracked_noise_artifacts(repo)
         dirty = git_status_porcelain(repo)
-        if dirty:
+        if dirty and not sys.stdin.isatty():
             raise SystemExit(
                 "El repo objetivo tiene cambios sin commit.\n"
                 "Haz commit/stash primero o activa --allow-dirty-repo."

@@ -11,8 +11,8 @@ def cmd_report(args) -> None:
     repo, ai_dir, recorder = core.init_run_context(config._raw_args)
     core.preflight(config._raw_args, repo)
 
-    goals_path = core.resolve_goals_path(repo, config.goals)
-    goals_text = core.read_text(goals_path, default="# PROJECT_GOALS.md\n\n[Missing goals file]\n")
+    goals_input = core.resolve_goals_input(repo, ai_dir, config._raw_args)
+    goals_text = goals_input.text
 
     plan_text = core.read_text(ai_dir / "plan.md", default="")
     test_report_md = core.read_text(ai_dir / "test-report.md", default="[Missing test report]")
@@ -24,14 +24,15 @@ def cmd_report(args) -> None:
         with core.record_stage(recorder, "report") as details:
             core.clear_artifacts(ai_dir, ["final.md", "report-prompt.txt", "report-raw.txt", "report-model.md", "report-error.md"])
             base_ref = config.base_ref.strip() or core.infer_base_ref(repo)
-            git_diff = core.collect_git_diff(repo, base_ref)
-            changed_files = core.collect_git_changed_files(repo, base_ref)
+            metadata_payload = json.loads(run_metadata) if run_metadata.strip().startswith("{") else recorder.metadata
+            changed_files, git_diff = core.collect_report_context(repo, base_ref, metadata_payload, config.ai_dir)
 
             prompt = core.build_report_prompt(goals_text, plan_text, test_report_md, git_diff, run_metadata)
-            metadata_payload = json.loads(run_metadata) if run_metadata.strip().startswith("{") else recorder.metadata
             details["artifact"] = str(ai_dir / "final.md")
             details["base_ref"] = base_ref
             details["report_timeout"] = core.effective_report_timeout(config._raw_args)
+            details["goals_source"] = goals_input.source
+            details["goals_path"] = goals_input.path
             details.update(
                 core.maybe_write_model_report(
                     ai_dir,
@@ -60,11 +61,3 @@ def cmd_report(args) -> None:
         print(f"report: failed. See {error_path}")
         raise
     recorder.complete_run("ok", {"final_report": str(ai_dir / "final.md")})
-    final_md = core.build_grounded_final_report(
-        recorder.metadata,
-        plan_text,
-        test_report_md,
-        core.collect_git_changed_files(repo, config.base_ref.strip() or core.infer_base_ref(repo)),
-        core.collect_git_diff(repo, config.base_ref.strip() or core.infer_base_ref(repo)),
-    )
-    core.safe_write(ai_dir / "final.md", final_md)
