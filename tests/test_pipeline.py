@@ -1,10 +1,13 @@
 import argparse
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from molde_maestro import pipeline
 
@@ -304,6 +307,30 @@ class ApplyScopeTests(unittest.TestCase):
         self.assertEqual(audit["issues"][0]["file"], "src/exam_pipeline/ingest.py")
         self.assertIn("pdf2image", audit["issues"][0]["missing_dependencies"])
 
+    def test_audit_python_dependency_declarations_reads_pyproject_dependencies(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            (repo / "pyproject.toml").write_text(
+                """
+[project]
+name = "exam-pipeline"
+version = "0.1.0"
+dependencies = ["requests>=2", "Pillow>=10"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+""".strip(),
+                encoding="utf-8",
+            )
+            (repo / "src/exam_pipeline").mkdir(parents=True)
+            (repo / "src/exam_pipeline/ingest.py").write_text(
+                "import requests\nfrom PIL import Image\n",
+                encoding="utf-8",
+            )
+            audit = pipeline.audit_python_dependency_declarations(repo, ["src/exam_pipeline/ingest.py"])
+        self.assertTrue(audit["ok"])
+        self.assertEqual(audit["issues"], [])
+
     def test_default_aider_instruction_includes_scope_and_files(self) -> None:
         instruction = pipeline.default_aider_instruction(
             "# Repo Review Plan",
@@ -424,6 +451,28 @@ class ValidationProfileTests(unittest.TestCase):
         data = pipeline.validation_plan_to_dict(plan)
         self.assertEqual(data["promotion_decision"], "not_promoted")
         self.assertEqual(data["runner"]["python"], "python3")
+
+    def test_python_module_name_for_path_normalizes_src_layout(self) -> None:
+        self.assertEqual(pipeline.python_module_name_for_path("src/pkg/mod.py"), "pkg.mod")
+        self.assertEqual(pipeline.python_module_name_for_path("src/pkg/__init__.py"), "pkg")
+        self.assertEqual(pipeline.python_module_name_for_path("main.py"), "main")
+
+    def test_run_python_smoke_imports_uses_src_root_modules(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            (repo / "src/pkg").mkdir(parents=True)
+            (repo / "src/pkg/mod.py").write_text("VALUE = 1\n", encoding="utf-8")
+            smoke = pipeline.run_python_smoke_imports(
+                repo,
+                ["src/pkg/mod.py", "src/pkg/__init__.py", "main.py"],
+                sys.executable,
+                timeout=5,
+            )
+        self.assertEqual(smoke["status"], "failed")
+        self.assertIn("pkg.mod", smoke["modules"])
+        self.assertIn("pkg", smoke["modules"])
+        self.assertIn("main", smoke["modules"])
+        self.assertNotIn("src.pkg.mod", smoke["modules"])
 
 
 class RunRecorderTests(unittest.TestCase):
@@ -606,6 +655,164 @@ class CommandArtifactTests(unittest.TestCase):
             self.assertEqual(attempts[0]["status"], "timeout")
             self.assertEqual(attempts[1]["mode"], "fast")
             self.assertTrue((ai_dir / "plan-raw.txt").exists())
+
+    @mock.patch("molde_maestro.pipeline.preflight")
+    @mock.patch("molde_maestro.pipeline.call_model")
+    def test_cmd_report_writes_grounded_report_when_model_fails(
+        self,
+        mock_call_model: mock.Mock,
+        _mock_preflight: mock.Mock,
+    ) -> None:
+        mock_call_model.side_effect = pipeline.ExecutionFailure("reviewer offline", status="timeout")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            ai_dir = repo / "AI"
+            ai_dir.mkdir()
+            (repo / "PROJECT_GOALS.md").write_text("- keep stable\n", encoding="utf-8")
+            (ai_dir / "plan.md").write_text("# Repo Review Plan\n\n1) Change: Fix foo\n", encoding="utf-8")
+            (ai_dir / "test-report.md").write_text("- stage_status: **ok**\n", encoding="utf-8")
+            (ai_dir / "run-metadata.json").write_text(json.dumps({"status": "ok", "stages": []}), encoding="utf-8")
+            args = argparse.Namespace(
+                repo=str(repo),
+                ai_dir="AI",
+                cmd="report",
+                goals="PROJECT_GOALS.md",
+                reasoner="ollama:deepseek-r1",
+                base_ref="HEAD~1",
+                report_timeout=15,
+                reasoner_timeout=15,
+                _config_path=None,
+            )
+
+            with mock.patch("molde_maestro.pipeline.collect_git_diff", return_value="diff --git a/src/foo.py b/src/foo.py"):
+                with mock.patch("molde_maestro.pipeline.collect_git_changed_files", return_value=["src/foo.py"]):
+                    pipeline.cmd_report(args)
+
+            self.assertTrue((ai_dir / "final.md").exists())
+            self.assertFalse((ai_dir / "report.md").exists())
+            metadata = json.loads((ai_dir / "report-command-metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["status"], "ok")
+            report_stage = metadata["stages"][0]
+            self.assertEqual(report_stage["details"]["model_summary_status"], "failed")
+            self.assertTrue((ai_dir / "report-model-error.md").exists())
+
+    @mock.patch("molde_maestro.pipeline.preflight")
+    @mock.patch("molde_maestro.pipeline.call_model", return_value="# Final Report\n\nModel summary\n")
+    def test_cmd_report_skips_optional_model_when_reasoner_missing(
+        self,
+        mock_call_model: mock.Mock,
+        _mock_preflight: mock.Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            ai_dir = repo / "AI"
+            ai_dir.mkdir()
+            (repo / "PROJECT_GOALS.md").write_text("- keep stable\n", encoding="utf-8")
+            (ai_dir / "plan.md").write_text("# Repo Review Plan\n\n1) Change: Fix foo\n", encoding="utf-8")
+            (ai_dir / "test-report.md").write_text("- stage_status: **ok**\n", encoding="utf-8")
+            (ai_dir / "run-metadata.json").write_text(json.dumps({"status": "ok", "stages": []}), encoding="utf-8")
+            args = argparse.Namespace(
+                repo=str(repo),
+                ai_dir="AI",
+                cmd="report",
+                goals="PROJECT_GOALS.md",
+                reasoner="",
+                base_ref="HEAD~1",
+                report_timeout=15,
+                reasoner_timeout=15,
+                _config_path=None,
+            )
+
+            with mock.patch("molde_maestro.pipeline.collect_git_diff", return_value="diff --git a/src/foo.py b/src/foo.py"):
+                with mock.patch("molde_maestro.pipeline.collect_git_changed_files", return_value=["src/foo.py"]):
+                    pipeline.cmd_report(args)
+
+            mock_call_model.assert_not_called()
+            metadata = json.loads((ai_dir / "report-command-metadata.json").read_text(encoding="utf-8"))
+            report_stage = metadata["stages"][0]
+            self.assertEqual(report_stage["details"]["model_summary_status"], "skipped")
+
+    @mock.patch("molde_maestro.pipeline.preflight")
+    def test_cmd_run_relies_on_validation_plan_instead_of_raw_test_cmd(self, _mock_preflight: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            (repo / "PROJECT_GOALS.md").write_text("- keep stable\n", encoding="utf-8")
+            args = argparse.Namespace(
+                repo=str(repo),
+                ai_dir="AI",
+                cmd="run",
+                goals="PROJECT_GOALS.md",
+                reasoner="ollama:deepseek-r1",
+                aider_model="ollama:qwen3-coder:14b",
+                test_cmd="",
+                lint_cmd="",
+                lint_required=False,
+                max_iters=1,
+                zip=False,
+                base="",
+                branch="",
+                aider_timeout=15,
+                test_timeout=15,
+                report_timeout=15,
+                reasoner_timeout=15,
+                plan_mode="balanced",
+                extra_context=[],
+                aider_extra_arg=[],
+                apply_limit_to_plan_files=True,
+                apply_enforce_plan_scope=True,
+                apply_skip_unsupported_plan_changes=False,
+                allowed_file=[],
+                apply_max_plan_changes=0,
+                base_ref="",
+                _config_path=None,
+            )
+            validation_plan = pipeline.ValidationPlan(
+                profile="python_local",
+                source="auto",
+                suggested_profile="python_local",
+                suggestion_reason="reason",
+                promotion_decision="not_promoted",
+                promotion_reasons=[],
+                promotion_blockers=[],
+                test_command="python3 -m compileall src",
+                lint_command=None,
+                semantic_validation=False,
+                semantic_validation_mode="auto",
+                semantic_validation_strict=False,
+                semantic_validation_timeout=60,
+                smoke_imports=False,
+                smoke_imports_strict=False,
+                smoke_import_runner=None,
+                checks=[],
+                context=pipeline.ValidationContext(
+                    is_python_repo=True,
+                    has_tests=False,
+                    has_pyproject=True,
+                    has_requirements=False,
+                    has_src_dir=True,
+                    has_main_py=False,
+                    has_dot_venv=False,
+                    has_uv_lock=False,
+                    has_setup_cfg=False,
+                    python_runner="python3",
+                    python_runner_source="system",
+                    runner_reproducible=False,
+                    runner_usable=True,
+                    pytest_available=False,
+                    pytest_command="",
+                    compile_command="python3 -m compileall src",
+                    repo_notes=[],
+                    suggested_profile="python_local",
+                    suggestion_reason="reason",
+                    promotion_reasons=[],
+                    promotion_blockers=[],
+                ),
+            )
+
+            with mock.patch("molde_maestro.pipeline.resolve_validation_plan", return_value=validation_plan):
+                with mock.patch("molde_maestro.pipeline.run_plan_generation", side_effect=RuntimeError("stop after validation")):
+                    with self.assertRaisesRegex(RuntimeError, "stop after validation"):
+                        pipeline.cmd_run(args)
 
 
 class TestReportTests(unittest.TestCase):

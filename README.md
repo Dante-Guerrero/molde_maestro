@@ -75,6 +75,25 @@ Esto:
 - instala dependencias del proyecto (según `pyproject.toml` y `uv.lock`)
 - deja disponible el comando `molde-maestro` dentro del entorno
 
+### 2.1) Instala herramientas de desarrollo y prueba
+Si vas a trabajar en el repo o correr la suite completa:
+
+```bash
+uv sync --extra dev
+```
+
+Eso instala al menos:
+- `pytest`
+- `ruff`
+
+Pruebas locales recomendadas:
+
+```bash
+uv run pytest -q
+uv run python -m unittest discover -s tests -q
+uv run ruff check .
+```
+
 ### 3) Ejecuta el CLI dentro del entorno
 Opción A (simple): prefix con `uv run`:
 
@@ -135,6 +154,8 @@ ai_dir: AI
 reasoner: "ollama:deepseek-r1"
 aider_model: "ollama:qwen3-coder:14b"
 
+# Opcional: si no lo defines, el pipeline intenta derivarlo
+# automáticamente desde el repo objetivo.
 test_cmd: "pytest -q"
 lint_cmd: "ruff check . || true"
 
@@ -183,6 +204,8 @@ ai_dir: AI
 reasoner: "ollama:deepseek-r1"
 aider_model: "ollama:qwen3-coder:14b"
 
+# Opcional: si el repo objetivo tiene suficiente evidencia
+# (por ejemplo `tests/`, `src/`, `.venv`), puede autodetectarse.
 test_cmd: "pytest -q"
 lint_cmd: "ruff check . || true"
 
@@ -201,6 +224,7 @@ uv run molde-maestro run
 ```
 
 Si existe `molde_maestro.yml/.yaml/.json`, el CLI tomará valores de ahí y solo necesitas `run`.
+Si omites `test_cmd`, `run` y `test` intentarán derivar un comando válido automáticamente.
 
 ### 4) Revisa resultados (en el repo objetivo)
 En el repo objetivo verás:
