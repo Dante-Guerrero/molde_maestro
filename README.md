@@ -12,7 +12,7 @@
 
 El objetivo del proyecto no es solo “editar código”, sino dejar una corrida reproducible, auditable y con artefactos en `AI/` para entender qué se planeó, qué se cambió y cómo se validó.
 
-## 2. Cómo usarlo paso a paso
+## 2. Formas de ejecutar `molde_maestro`
 
 ### Requisitos
 
@@ -38,6 +38,199 @@ Si quieres ejecutar el CLI sin instalarlo globalmente:
 ```bash
 uv run molde-maestro --help
 ```
+
+Si prefieres invocarlo como módulo Python:
+
+```bash
+python -m molde_maestro.cli --help
+```
+
+### Formas de invocación
+
+`molde_maestro` puede ejecutarse de cuatro maneras principales:
+
+- como binario expuesto por el paquete: `molde-maestro ...`
+- con `uv run`: `uv run molde-maestro ...`
+- como módulo Python: `python -m molde_maestro.cli ...`
+- con configuración, flags o modo interactivo según el caso
+
+#### 1. Mostrar ayuda de la CLI
+
+Para ver subcomandos y flags disponibles:
+
+```bash
+uv run molde-maestro --help
+```
+
+Ayuda de un subcomando concreto:
+
+```bash
+uv run molde-maestro run --help
+uv run molde-maestro plan --help
+uv run molde-maestro apply --help
+uv run molde-maestro test --help
+uv run molde-maestro report --help
+uv run molde-maestro snapshot --help
+```
+
+#### 2. Ejecutar con archivo de configuración
+
+Si existe `molde_maestro.yml`, `molde_maestro.yaml` o `molde_maestro.json` en el directorio actual, puedes correr:
+
+```bash
+uv run molde-maestro run
+```
+
+También puedes apuntar a un archivo específico:
+
+```bash
+uv run molde-maestro --config ./molde_maestro.yml run
+```
+
+Si ejecutas `uv run molde-maestro` sin subcomando y existe config, el programa asume `run`.
+
+#### 3. Ejecutar pasando todo por flags
+
+Puedes correr cualquier subcomando sin config, solo con argumentos CLI:
+
+```bash
+uv run molde-maestro run \
+  --repo . \
+  --goals PROJECT_GOALS.md \
+  --reasoner ollama:qwen2.5-coder:7b \
+  --aider-model ollama:qwen2.5-coder:7b \
+  --test-cmd "python3 -m compileall src"
+```
+
+Esto mismo aplica para `plan`, `apply`, `test`, `report` y `snapshot`.
+
+#### 4. Ejecutar en modo interactivo
+
+Si la sesión es interactiva (`stdin` TTY), la CLI puede pedir datos faltantes en tiempo de ejecución:
+
+- selección de `reasoner`
+- selección de `aider_model`
+- ingreso manual de goals si falta `PROJECT_GOALS.md`
+- confirmaciones para limpiar artefactos generados
+- confirmaciones para crear commits
+- confirmaciones para agregar dependencias faltantes detectadas durante `apply`
+
+Si la sesión no es interactiva, `molde_maestro` no espera input y falla de forma explícita cuando una decisión humana es necesaria.
+
+### Subcomandos disponibles
+
+#### `run`
+
+Ejecuta el pipeline completo: plan -> apply -> test -> report.
+
+```bash
+uv run molde-maestro run
+```
+
+#### `plan`
+
+Genera `AI/plan.md` usando el modelo reasoner.
+
+```bash
+uv run molde-maestro plan --repo .
+```
+
+#### `apply`
+
+Aplica `AI/plan.md` con `aider`.
+
+```bash
+uv run molde-maestro apply --repo .
+```
+
+#### `test`
+
+Ejecuta validación y genera `AI/test-report.md`.
+
+```bash
+uv run molde-maestro test --repo . --test-cmd "python3 -m compileall src"
+```
+
+#### `report`
+
+Genera `AI/final.md` usando el plan, el diff y la validación real.
+
+```bash
+uv run molde-maestro report --repo .
+```
+
+#### `snapshot`
+
+Crea un zip del repositorio en el ref indicado.
+
+```bash
+uv run molde-maestro snapshot --repo . --zip
+```
+
+### Configuración por archivo o por flags
+
+Puedes combinar config + flags:
+
+- el config define defaults
+- los flags completan o sobreescriben lo necesario según el merge actual de la CLI
+- las rutas relativas de `repo` dentro del config se resuelven respecto al directorio del archivo de config
+
+Ejemplo:
+
+```bash
+uv run molde-maestro --config ./molde_maestro.yml run --repo ../otro_repo
+```
+
+### Ejemplos típicos de ejecución
+
+Pipeline completo usando config local:
+
+```bash
+uv run molde-maestro run
+```
+
+Pipeline completo por flags:
+
+```bash
+uv run molde-maestro run \
+  --repo . \
+  --goals PROJECT_GOALS.md \
+  --reasoner ollama:qwen2.5-coder:7b \
+  --aider-model ollama:qwen2.5-coder:7b \
+  --test-cmd "python3 -m compileall src"
+```
+
+Generar solo el plan:
+
+```bash
+uv run molde-maestro plan --repo .
+```
+
+Aplicar un plan existente:
+
+```bash
+uv run molde-maestro apply --repo .
+```
+
+Validar cambios:
+
+```bash
+uv run molde-maestro test --repo . --test-cmd "python3 -m compileall src"
+```
+
+Generar solo el reporte:
+
+```bash
+uv run molde-maestro report --repo .
+```
+
+Crear snapshot:
+
+```bash
+uv run molde-maestro snapshot --repo . --zip
+```
+
+## 3. Cómo usarlo paso a paso
 
 ### Preparar el repo objetivo
 
@@ -105,50 +298,9 @@ Si el repo objetivo contiene artefactos generados típicos como `.DS_Store`, `__
 - si respondes `n`, no limpia nada;
 - si la sesión no es interactiva y hay limpieza necesaria, la corrida se detiene para no decidir por ti.
 
-O por flags:
-
-```bash
-uv run molde-maestro run \
-  --repo . \
-  --goals PROJECT_GOALS.md \
-  --reasoner ollama:qwen2.5-coder:7b \
-  --aider-model ollama:qwen2.5-coder:7b \
-  --test-cmd "python3 -m compileall src"
-```
-
 ### Ejecutar subcomandos por separado
 
-Generar solo el plan:
-
-```bash
-uv run molde-maestro plan --repo .
-```
-
-Aplicar un plan ya generado:
-
-```bash
-uv run molde-maestro apply --repo .
-```
-
 `apply` usa la misma detección de artefactos generados y también confirma con `y/n` antes de limpiar archivos trackeados que puedan degradar el contexto de Aider.
-
-Ejecutar validación:
-
-```bash
-uv run molde-maestro test --repo . --test-cmd "python3 -m compileall src"
-```
-
-Generar el reporte final:
-
-```bash
-uv run molde-maestro report --repo .
-```
-
-Crear snapshot zip:
-
-```bash
-uv run molde-maestro snapshot --repo . --zip
-```
 
 ### Qué produce una corrida
 
@@ -181,7 +333,7 @@ Lint:
 uv run ruff check .
 ```
 
-## 3. Explicación del contenido de todos los archivos
+## 4. Explicación del contenido de todos los archivos
 
 ### Archivos de raíz
 
