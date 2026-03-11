@@ -25,6 +25,23 @@ El objetivo del proyecto no es solo “editar código”, sino dejar una corrida
   - `reasoner`
   - `aider_model`
 
+### Defaults de seguridad
+
+- `run` y `apply` detectan tu rama original y trabajan sobre una rama aislada `ai/<timestamp>-<slug>` por defecto.
+- Al terminar, `molde_maestro` te deja en la rama resultado para revisar inmediatamente los cambios.
+- Si el repo está sucio, la herramienta bloquea en modo no interactivo y en modo interactivo solo ofrece checkpoint commit o abortar.
+- `test_cmd`, `lint_cmd` con shell y `reasoner=cmd:...` requieren `--unsafe-shell`.
+- Si la solución introduce una dependencia nueva, `molde_maestro` nunca la agrega por sorpresa:
+  - en modo interactivo pide aprobación explícita;
+  - en modo no interactivo la deja pendiente y degrada el resultado.
+
+### Garantías de CI del proyecto
+
+- la suite automatizada ejecuta `pytest`;
+- verifica higiene de archivos trackeados antes del build;
+- construye wheel y sdist con `uv build`;
+- instala el wheel generado y valida `molde-maestro --help`.
+
 ### Instalación
 
 Desde la raíz del repo:
@@ -89,6 +106,14 @@ uv run molde-maestro --config ./molde_maestro.yml run
 
 Si ejecutas `uv run molde-maestro` sin subcomando y existe config, el programa asume `run`.
 
+Durante `run` o `apply`, la herramienta registra en metadata:
+
+- rama original detectada
+- rama de trabajo creada o reutilizada
+- base de comparación usada
+- SHA antes y después de la corrida
+- estado de dependencias nuevas detectadas
+
 #### 3. Ejecutar pasando todo por flags
 
 Puedes correr cualquier subcomando sin config, solo con argumentos CLI:
@@ -113,7 +138,7 @@ Si la sesión es interactiva (`stdin` TTY), la CLI puede pedir datos faltantes e
 - ingreso manual de goals si falta `PROJECT_GOALS.md`
 - confirmaciones para limpiar artefactos generados
 - confirmaciones para crear commits
-- confirmaciones para agregar dependencias faltantes detectadas durante `apply`
+- decisión explícita cuando `apply` detecta dependencias nuevas o no declaradas
 
 Si la sesión no es interactiva, `molde_maestro` no espera input y falla de forma explícita cuando una decisión humana es necesaria.
 
@@ -175,6 +200,10 @@ Puedes combinar config + flags:
 - los flags completan o sobreescriben lo necesario según el merge actual de la CLI
 - las rutas relativas de `repo` dentro del config se resuelven respecto al directorio del archivo de config
 
+Flag relevante de seguridad:
+
+- `--unsafe-shell`: permite `test_cmd`/`lint_cmd` con metacaracteres de shell y `reasoner=cmd:...`. Sin este flag, la CLI rechaza esos modos por defecto.
+
 Ejemplo:
 
 ```bash
@@ -229,6 +258,15 @@ Crear snapshot:
 ```bash
 uv run molde-maestro snapshot --repo . --zip
 ```
+
+### Qué pasa si `molde_maestro` quiere una librería nueva
+
+Si durante `apply` aparece un import nuevo no declarado:
+
+- en modo interactivo, la herramienta muestra la librería sugerida, los archivos afectados y pide una decisión explícita;
+- en modo no interactivo, no edita manifiestos y deja la dependencia como pendiente;
+- toda decisión queda registrada en `AI/run-metadata.json` y resumida en `AI/final.md`;
+- si la dependencia queda pendiente o rechazada, la corrida no se considera `ok` pleno.
 
 ## 3. Cómo usarlo paso a paso
 
@@ -342,6 +380,7 @@ uv run ruff check .
 - `pyproject.toml`: metadatos del paquete, dependencias, extras de desarrollo y entrypoint `molde-maestro`.
 - `uv.lock`: lockfile de dependencias para instalaciones reproducibles con `uv`.
 - `molde_maestro.yml`: ejemplo o configuración local para correr el pipeline sin repetir flags.
+- `.github/workflows/ci.yml`: workflow de CI que corre tests, verifica higiene trackeada, construye el paquete y prueba el wheel generado.
 
 ### Código fuente en `src/molde_maestro/`
 
@@ -368,6 +407,7 @@ uv run ruff check .
 ### Tests
 
 - `tests/test_pipeline.py`: suite unitaria principal; cubre config, parser, validación, reportes, comandos y regresiones del pipeline.
+- `tests/test_repo_hygiene.py`: chequeo de higiene para asegurar que el repo no trackea artefactos no distribuibles.
 
 ## Resumen rápido
 
@@ -378,3 +418,10 @@ Si quieres usar el proyecto con lo mínimo:
 3. configura `reasoner`, `aider_model` y `test_cmd`
 4. ejecuta `uv run molde-maestro run`
 5. revisa `AI/plan.md`, `AI/test-report.md` y `AI/final.md`
+
+Para validar este mismo repositorio:
+
+```bash
+uv run --extra dev python -m pytest -q
+uv build
+```

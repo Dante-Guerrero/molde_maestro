@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
+from typing import Any
 
 from .. import pipeline as core
 from ..command_config import ApplyCommandConfig
@@ -20,13 +22,15 @@ def cmd_apply(args) -> None:
     plan_text = core.read_text(plan_path, default="")
     if not plan_text.strip():
         raise SystemExit(f"apply: falta o está vacío {plan_path}. Ejecuta `plan` primero.")
+    git_ctx = core.initialize_git_run_context(repo, config._raw_args, plan_text)
+    core.attach_git_run_context(recorder, git_ctx)
+    dependency_report: dict[str, Any] = {"dependency_changes_detected": False}
+    final_changed_files: list[str] = []
 
     try:
         with core.record_stage(recorder, "apply") as details:
             core.clear_artifacts(ai_dir, ["aider-log.txt", "aider-message.txt", "apply-error.md", "apply-scope.json", "apply-selected-plan.md"])
-            active_branch = core.git_current_branch(repo)
-            prep = core.ensure_repo_ready_for_apply_session(repo, config._raw_args)
-            pre_apply_head = core.git_head_commit(repo)
+            git_ctx, prep, pre_apply_head, active_branch = core.prepare_apply_git_session(repo, recorder, git_ctx, config._raw_args)
 
             core.ensure_repo_ready_for_aider(repo)
 
@@ -77,6 +81,10 @@ def cmd_apply(args) -> None:
             details["skipped_change_titles"] = apply_scope.skipped_change_titles
             details["cleaned_tracked_noise_files"] = prep["cleaned_tracked_noise_files"]
             details["preexisting_commit"] = prep["preexisting_commit"]
+            details["original_branch"] = git_ctx.original_branch
+            details["work_branch"] = git_ctx.work_branch
+            details["base_ref"] = git_ctx.base_ref
+            details["head_before_run"] = git_ctx.head_before_run
             details["stdout_excerpt"] = core.truncate(stdout, 2000)
             if apply_scope.selected_files:
                 terminal_ui.print_kv_summary(
@@ -123,39 +131,27 @@ def cmd_apply(args) -> None:
             dep_audit = core.audit_python_dependency_declarations(repo, changed_files)
             details["dependency_audit"] = dep_audit
             if not dep_audit["ok"]:
-                dep_resolution = core.resolve_missing_python_dependencies(repo, dep_audit)
+                dep_resolution = core.resolve_missing_python_dependencies(repo, dep_audit, changed_files)
                 details["dependency_resolution"] = dep_resolution
-                if not dep_resolution["ok"]:
+                dependency_report = dep_resolution
+                core.persist_dependency_report(recorder, dep_resolution)
+                if dep_resolution.get("decision") == "aborted":
                     raise core.ExecutionFailure(
-                        "Aider introduced Python imports whose dependencies are not declared in the repo.",
+                        "La corrida fue abortada por dependencias nuevas pendientes de aprobacion.",
                         command=f"aider --model {core.normalize_aider_model_name(config.aider_model)}",
                         stdout=stdout,
-                        stderr=json.dumps(
-                            {
-                                "dependency_audit": dep_audit,
-                                "dependency_resolution": dep_resolution,
-                            },
-                            ensure_ascii=False,
-                        ),
+                        stderr=json.dumps(dep_resolution, ensure_ascii=False),
                         status="failed",
                     )
-                aider_result = core.reconcile_dependency_resolution(repo, pre_apply_head, aider_result, dep_resolution)
-                changed_files = aider_result["changed_files"]
-                details["aider_result_mode"] = aider_result["mode"]
-                details["aider_commit_created"] = aider_result["commit_created"]
-                details["head_after_apply"] = aider_result["head_after"]
-                details["dependency_resolution_commit"] = aider_result.get("dependency_commit")
-                dep_audit = core.audit_python_dependency_declarations(repo, changed_files)
-                details["dependency_audit"] = dep_audit
-                if not dep_audit["ok"]:
-                    raise core.ExecutionFailure(
-                        "Dependency update did not resolve undeclared Python imports.",
-                        command=f"aider --model {core.normalize_aider_model_name(config.aider_model)}",
-                        stdout=stdout,
-                        stderr=json.dumps(dep_audit, ensure_ascii=False),
-                        status="failed",
-                    )
+                if dep_resolution.get("dependency_changes_applied"):
+                    aider_result = core.reconcile_dependency_resolution(repo, pre_apply_head, aider_result, dep_resolution)
+                    changed_files = aider_result["changed_files"]
+                    details["aider_result_mode"] = aider_result["mode"]
+                    details["aider_commit_created"] = aider_result["commit_created"]
+                    details["head_after_apply"] = aider_result["head_after"]
+                    details["dependency_resolution_commit"] = aider_result.get("dependency_commit")
             details["changed_files"] = changed_files
+            final_changed_files = changed_files
             terminal_ui.print_status("info", f"Aider finalizo con codigo {rc}")
             print(core.explain_completed_changes(details["selected_change_titles"], changed_files))
             commit_sha = None
@@ -168,6 +164,8 @@ def cmd_apply(args) -> None:
                 )
             details["result_commit"] = commit_sha
             details["dirty_after_apply"] = core.git_has_working_tree_changes(repo)
+            git_ctx = dataclasses.replace(git_ctx, head_after_run=core.git_head_commit(repo))
+            core.attach_git_run_context(recorder, git_ctx)
     except BaseException as exc:
         error_path = core.write_stage_error(ai_dir, "apply", exc, {"aider_timeout": config.aider_timeout})
         recorder.fail_run(
@@ -177,4 +175,15 @@ def cmd_apply(args) -> None:
         )
         terminal_ui.print_human_error_summary("apply", str(exc), error_path, hint="Revisa el artefacto de error para el detalle tecnico.")
         raise
-    recorder.complete_run("ok", {"plan_path": str(plan_path)})
+    final_status = core.classify_final_status(None, dependency_report)
+    core.finalize_apply_like_command(
+        recorder,
+        final_status=final_status,
+        git_ctx=git_ctx,
+        ai_dir=ai_dir,
+        changed_files=final_changed_files,
+        dependency_report=dependency_report,
+        summary_details={
+            "plan_path": str(plan_path),
+        },
+    )

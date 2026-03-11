@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,8 @@ def cmd_run(args) -> None:
 
     goals_input = core.resolve_goals_input(repo, ai_dir, config._raw_args)
     goals_text = goals_input.text
+    git_ctx = core.initialize_git_run_context(repo, config._raw_args, goals_text)
+    core.attach_git_run_context(recorder, git_ctx)
     try:
         with core.record_stage(recorder, "plan") as details:
             plan_md, plan_meta = core.run_plan_generation(repo, ai_dir, goals_text, config._raw_args)
@@ -48,12 +51,11 @@ def cmd_run(args) -> None:
         test_summary: dict[str, Any] = {"status": "failed"}
         final_changed_files: list[str] = []
         selected_change_titles: list[str] = []
+        dependency_report: dict[str, Any] = {"dependency_changes_detected": False}
 
         with core.record_stage(recorder, "apply") as details:
             core.clear_artifacts(ai_dir, ["aider-log.txt", "aider-message.txt", "apply-error.md", "apply-scope.json", "apply-selected-plan.md", "test-report.md", "test-report.json", "test-error.md", "final.md", "report-prompt.txt", "report-raw.txt", "report-model.md", "report-error.md"])
-            active_branch = core.git_current_branch(repo)
-            prep = core.ensure_repo_ready_for_apply_session(repo, config._raw_args)
-            pre_apply_head = core.git_head_commit(repo)
+            git_ctx, prep, pre_apply_head, active_branch = core.prepare_apply_git_session(repo, recorder, git_ctx, config._raw_args)
             if prep["cleaned_tracked_noise_files"]:
                 terminal_ui.print_status("info", f"Artefactos limpiados: {', '.join(prep['cleaned_tracked_noise_files'])}")
 
@@ -96,6 +98,10 @@ def cmd_run(args) -> None:
             details["skipped_change_titles"] = apply_scope.skipped_change_titles
             details["cleaned_tracked_noise_files"] = prep["cleaned_tracked_noise_files"]
             details["preexisting_commit"] = prep["preexisting_commit"]
+            details["original_branch"] = git_ctx.original_branch
+            details["work_branch"] = git_ctx.work_branch
+            details["base_ref"] = git_ctx.base_ref
+            details["head_before_run"] = git_ctx.head_before_run
             if apply_scope.selected_files:
                 terminal_ui.print_kv_summary(
                     "Scope de run/apply:",
@@ -152,38 +158,25 @@ def cmd_run(args) -> None:
                 dep_audit = core.audit_python_dependency_declarations(repo, changed_files)
                 details["dependency_audit"] = dep_audit
                 if not dep_audit["ok"]:
-                    dep_resolution = core.resolve_missing_python_dependencies(repo, dep_audit)
+                    dep_resolution = core.resolve_missing_python_dependencies(repo, dep_audit, changed_files)
                     details["dependency_resolution"] = dep_resolution
-                    if not dep_resolution["ok"]:
+                    dependency_report = dep_resolution
+                    core.persist_dependency_report(recorder, dep_resolution)
+                    if dep_resolution.get("decision") == "aborted":
                         raise core.ExecutionFailure(
-                            "Aider introduced Python imports whose dependencies are not declared in the repo.",
+                            "La corrida fue abortada por dependencias nuevas pendientes de aprobacion.",
                             command=f"aider --model {core.normalize_aider_model_name(config.aider_model)}",
                             stdout=stdout,
-                            stderr=json.dumps(
-                                {
-                                    "dependency_audit": dep_audit,
-                                    "dependency_resolution": dep_resolution,
-                                },
-                                ensure_ascii=False,
-                            ),
+                            stderr=json.dumps(dep_resolution, ensure_ascii=False),
                             status="failed",
                         )
-                    aider_result = core.reconcile_dependency_resolution(repo, pre_apply_head, aider_result, dep_resolution)
-                    changed_files = aider_result["changed_files"]
-                    details["aider_result_mode"] = aider_result["mode"]
-                    details["aider_commit_created"] = aider_result["commit_created"]
-                    details["head_after_apply"] = aider_result["head_after"]
-                    details["dependency_resolution_commit"] = aider_result.get("dependency_commit")
-                    dep_audit = core.audit_python_dependency_declarations(repo, changed_files)
-                    details["dependency_audit"] = dep_audit
-                    if not dep_audit["ok"]:
-                        raise core.ExecutionFailure(
-                            "Dependency update did not resolve undeclared Python imports.",
-                            command=f"aider --model {core.normalize_aider_model_name(config.aider_model)}",
-                            stdout=stdout,
-                            stderr=json.dumps(dep_audit, ensure_ascii=False),
-                            status="failed",
-                        )
+                    if dep_resolution.get("dependency_changes_applied"):
+                        aider_result = core.reconcile_dependency_resolution(repo, pre_apply_head, aider_result, dep_resolution)
+                        changed_files = aider_result["changed_files"]
+                        details["aider_result_mode"] = aider_result["mode"]
+                        details["aider_commit_created"] = aider_result["commit_created"]
+                        details["head_after_apply"] = aider_result["head_after"]
+                        details["dependency_resolution_commit"] = aider_result.get("dependency_commit")
                 details["last_iteration"] = i
                 details["stdout_excerpt"] = core.truncate(stdout, 2000)
                 details["changed_files"] = changed_files
@@ -222,6 +215,8 @@ def cmd_run(args) -> None:
 
                 last_feedback = test_report_md
                 pre_apply_head = aider_result["head_after"]
+            git_ctx = dataclasses.replace(git_ctx, head_after_run=core.git_head_commit(repo))
+            core.attach_git_run_context(recorder, git_ctx)
 
         if not (ai_dir / "test-report.md").exists():
             core.safe_write(ai_dir / "test-report.md", "[No test report produced]\n")
@@ -232,7 +227,7 @@ def cmd_run(args) -> None:
 
         with core.record_stage(recorder, "report") as details:
             core.clear_artifacts(ai_dir, ["final.md", "report-prompt.txt", "report-raw.txt", "report-model.md", "report-error.md"])
-            base_ref = core.infer_base_ref(repo)
+            base_ref = git_ctx.base_ref
             changed_files, git_diff = core.collect_report_context(repo, base_ref, recorder.metadata, config.ai_dir)
             report_prompt = core.build_report_prompt(
                 goals_text,
@@ -253,7 +248,7 @@ def cmd_run(args) -> None:
                     core.effective_report_timeout(config._raw_args),
                 )
             )
-            projected_status = "ok" if final_passed else test_summary.get("status", "failed")
+            projected_status = core.classify_final_status(test_summary, dependency_report)
             final_md = core.build_grounded_final_report(
                 core.project_reported_metadata(recorder.metadata, projected_status),
                 plan_md,
@@ -292,9 +287,8 @@ def cmd_run(args) -> None:
         terminal_ui.print_human_error_summary(f"run/{failed_stage}", str(exc), error_path, hint="Revisa el artefacto de error y los reportes en AI/.")
         raise
 
-    final_status = test_summary.get("status", "ok") if final_passed else test_summary.get("status", "failed")
-    recorder.complete_run(final_status, {"tests_passed": final_passed, "test_status": test_summary.get("status", "failed"), "validation_profile": validation_plan.profile})
-    report_changed_files, report_diff = core.collect_report_context(repo, core.infer_base_ref(repo), recorder.metadata, config.ai_dir)
+    final_status = core.classify_final_status(test_summary, dependency_report)
+    report_changed_files, report_diff = core.collect_report_context(repo, git_ctx.base_ref, recorder.metadata, config.ai_dir)
     final_md = core.build_grounded_final_report(
         recorder.metadata,
         plan_md,
@@ -304,3 +298,16 @@ def cmd_run(args) -> None:
         validation_command=test_cmd,
     )
     core.safe_write(ai_dir / "final.md", final_md)
+    core.finalize_apply_like_command(
+        recorder,
+        final_status=final_status,
+        git_ctx=git_ctx,
+        ai_dir=ai_dir,
+        changed_files=report_changed_files or final_changed_files,
+        dependency_report=dependency_report,
+        summary_details={
+            "tests_passed": final_passed,
+            "test_status": test_summary.get("status", "failed"),
+            "validation_profile": validation_plan.profile,
+        },
+    )

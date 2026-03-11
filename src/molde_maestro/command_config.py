@@ -10,6 +10,7 @@ class BaseCommandConfig:
     ai_dir: str
     goals: str
     reasoner: str
+    unsafe_shell: bool
     _raw_args: Any = dataclasses.field(repr=False, compare=False)
 
 
@@ -26,6 +27,7 @@ class SnapshotCommandConfig(BaseCommandConfig):
             ai_dir=args.ai_dir,
             goals=args.goals,
             reasoner=args.reasoner,
+            unsafe_shell=bool(getattr(args, "unsafe_shell", False)),
             zip_enabled=bool(args.zip),
             ref=args.ref,
             out=args.out,
@@ -48,6 +50,7 @@ class PlanCommandConfig(BaseCommandConfig):
             ai_dir=args.ai_dir,
             goals=args.goals,
             reasoner=args.reasoner,
+            unsafe_shell=bool(getattr(args, "unsafe_shell", False)),
             plan_out=args.plan_out,
             plan_mode=args.plan_mode,
             reasoner_timeout=args.reasoner_timeout,
@@ -74,6 +77,7 @@ class ApplyCommandConfig(BaseCommandConfig):
             ai_dir=args.ai_dir,
             goals=args.goals,
             reasoner=args.reasoner,
+            unsafe_shell=bool(getattr(args, "unsafe_shell", False)),
             aider_model=args.aider_model,
             plan_mode=args.plan_mode,
             base=args.base,
@@ -97,6 +101,7 @@ class TestCommandConfig(BaseCommandConfig):
             ai_dir=args.ai_dir,
             goals=args.goals,
             reasoner=args.reasoner,
+            unsafe_shell=bool(getattr(args, "unsafe_shell", False)),
             lint_required=bool(args.lint_required),
             test_timeout=args.test_timeout,
             _raw_args=args,
@@ -115,6 +120,7 @@ class ReportCommandConfig(BaseCommandConfig):
             ai_dir=args.ai_dir,
             goals=args.goals,
             reasoner=args.reasoner,
+            unsafe_shell=bool(getattr(args, "unsafe_shell", False)),
             base_ref=args.base_ref,
             report_timeout=args.report_timeout,
             _raw_args=args,
@@ -143,6 +149,7 @@ class RunCommandConfig(BaseCommandConfig):
             ai_dir=args.ai_dir,
             goals=args.goals,
             reasoner=args.reasoner,
+            unsafe_shell=bool(getattr(args, "unsafe_shell", False)),
             aider_model=args.aider_model,
             zip_enabled=bool(args.zip),
             plan_mode=args.plan_mode,

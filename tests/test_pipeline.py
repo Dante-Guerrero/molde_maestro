@@ -174,6 +174,7 @@ class PreflightTests(unittest.TestCase):
             test_cmd="python3 -m compileall src",
             lint_cmd="",
             allow_dirty_repo=False,
+            unsafe_shell=False,
         )
 
     @mock.patch("molde_maestro.pipeline.git_status_porcelain", return_value="")
@@ -214,6 +215,22 @@ class PreflightTests(unittest.TestCase):
         pipeline.preflight(args, repo)
         self.assertEqual(mock_validate.call_count, 1)
         self.assertEqual(mock_validate.call_args[0][0].name, "qwen2.5-coder:14b")
+
+    def test_preflight_rejects_shell_commands_without_opt_in(self) -> None:
+        repo = Path("/tmp/repo")
+        args = self.make_args("test")
+        args.test_cmd = "python3 -m compileall src && pytest -q"
+        with self.assertRaisesRegex(SystemExit, "--unsafe-shell"):
+            with mock.patch("molde_maestro.pipeline.ensure_git_repo_ready"):
+                pipeline.preflight(args, repo)
+
+    def test_preflight_rejects_cmd_reasoner_without_opt_in(self) -> None:
+        repo = Path("/tmp/repo")
+        args = self.make_args("plan")
+        args.reasoner = "cmd:python3 fake_reasoner.py"
+        with self.assertRaisesRegex(SystemExit, "--unsafe-shell"):
+            with mock.patch("molde_maestro.pipeline.ensure_git_repo_ready"):
+                pipeline.preflight(args, repo)
 
     @mock.patch("sys.stdin.isatty", return_value=True)
     @mock.patch("builtins.input", return_value="y")
@@ -678,7 +695,7 @@ dev = ["pytest>=8"]
         self.assertEqual(audit["issues"], [])
 
     @mock.patch("sys.stdin.isatty", return_value=True)
-    @mock.patch("builtins.input", return_value="y")
+    @mock.patch("builtins.input", return_value="1")
     def test_resolve_missing_python_dependencies_updates_requirements(
         self,
         _mock_input: mock.Mock,
@@ -693,13 +710,14 @@ dev = ["pytest>=8"]
             )
             content = (repo / "requirements.txt").read_text(encoding="utf-8")
         self.assertTrue(resolution["ok"])
-        self.assertEqual(resolution["system"], "requirements.txt")
+        self.assertEqual(resolution["decision"], "approved")
+        self.assertEqual(resolution["strategy"]["system"], "requirements.txt")
         self.assertEqual(resolution["updated_file"], "requirements.txt")
         self.assertEqual(resolution["added_dependencies"], ["requests"])
         self.assertIn("requests", content)
 
     @mock.patch("sys.stdin.isatty", return_value=True)
-    @mock.patch("builtins.input", return_value="y")
+    @mock.patch("builtins.input", return_value="1")
     def test_resolve_missing_python_dependencies_updates_pyproject(
         self,
         _mock_input: mock.Mock,
@@ -723,13 +741,14 @@ dependencies = ["requests>=2"]
             )
             content = (repo / "pyproject.toml").read_text(encoding="utf-8")
         self.assertTrue(resolution["ok"])
-        self.assertEqual(resolution["system"], "pyproject.toml")
+        self.assertEqual(resolution["decision"], "approved")
+        self.assertEqual(resolution["strategy"]["system"], "pyproject.toml")
         self.assertEqual(resolution["updated_file"], "pyproject.toml")
         self.assertEqual(resolution["added_dependencies"], ["httpx"])
         self.assertIn('"httpx"', content)
 
     @mock.patch("sys.stdin.isatty", return_value=True)
-    @mock.patch("builtins.input", return_value="y")
+    @mock.patch("builtins.input", return_value="1")
     def test_resolve_missing_python_dependencies_updates_pyproject_with_extras(
         self,
         _mock_input: mock.Mock,
@@ -759,7 +778,7 @@ dependencies = ["uvicorn[standard]>=0.30"]
         self.assertEqual(parsed, {"uvicorn", "httpx"})
 
     @mock.patch("sys.stdin.isatty", return_value=True)
-    @mock.patch("builtins.input", return_value="y")
+    @mock.patch("builtins.input", return_value="1")
     def test_resolve_missing_python_dependencies_creates_requirements_when_missing(
         self,
         _mock_input: mock.Mock,
@@ -774,13 +793,13 @@ dependencies = ["uvicorn[standard]>=0.30"]
             exists = (repo / "requirements.txt").exists()
             content = (repo / "requirements.txt").read_text(encoding="utf-8")
         self.assertTrue(resolution["ok"])
-        self.assertEqual(resolution["system"], "none")
-        self.assertEqual(resolution["action"], "created")
+        self.assertEqual(resolution["decision"], "approved")
+        self.assertEqual(resolution["strategy"]["system"], "none")
         self.assertTrue(exists)
         self.assertEqual(content, "requests\n")
 
     @mock.patch("sys.stdin.isatty", return_value=True)
-    @mock.patch("builtins.input", return_value="n")
+    @mock.patch("builtins.input", return_value="2")
     def test_resolve_missing_python_dependencies_rejects_user(
         self,
         _mock_input: mock.Mock,
@@ -794,8 +813,9 @@ dependencies = ["uvicorn[standard]>=0.30"]
                 {"ok": False, "issues": [{"file": "main.py", "missing_dependencies": ["requests"]}]},
             )
             content = (repo / "requirements.txt").read_text(encoding="utf-8")
-        self.assertFalse(resolution["ok"])
-        self.assertEqual(resolution["reason"], "rejected")
+        self.assertTrue(resolution["ok"])
+        self.assertEqual(resolution["decision"], "rejected")
+        self.assertEqual(resolution["rejected_dependencies"], ["requests"])
         self.assertEqual(content, "")
 
     @mock.patch("sys.stdin.isatty", return_value=False)
@@ -810,12 +830,12 @@ dependencies = ["uvicorn[standard]>=0.30"]
                 repo,
                 {"ok": False, "issues": [{"file": "main.py", "missing_dependencies": ["requests"]}]},
             )
-        self.assertFalse(resolution["ok"])
-        self.assertEqual(resolution["reason"], "non_interactive")
-        self.assertEqual(resolution["action"], "aborted")
+        self.assertTrue(resolution["ok"])
+        self.assertEqual(resolution["decision"], "pending")
+        self.assertEqual(resolution["pending_dependencies"], ["requests"])
 
     @mock.patch("sys.stdin.isatty", return_value=True)
-    @mock.patch("builtins.input", return_value="y")
+    @mock.patch("builtins.input", return_value="1")
     def test_resolve_missing_python_dependencies_avoids_duplicates_on_accept(
         self,
         _mock_input: mock.Mock,
@@ -878,6 +898,41 @@ dependencies = ["uvicorn[standard]>=0.30"]
         self.assertIn("main.py", changed_since_start)
         self.assertIn("requirements.txt", changed_since_start)
         self.assertIn("requirements.txt", refreshed["changed_files"])
+
+    def test_detect_dependency_changes_marks_pending_in_non_interactive_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            (repo / "requirements.txt").write_text("", encoding="utf-8")
+            with mock.patch("sys.stdin.isatty", return_value=False):
+                report = pipeline.resolve_missing_python_dependencies(
+                    repo,
+                    {"ok": False, "issues": [{"file": "main.py", "missing_dependencies": ["requests"]}]},
+                    ["main.py"],
+                )
+        self.assertEqual(report["decision"], "pending")
+        self.assertEqual(report["pending_dependencies"], ["requests"])
+
+    def test_render_dependency_notice_mentions_pending_dependencies(self) -> None:
+        notice = pipeline.render_dependency_notice(
+            {
+                "dependency_changes_detected": True,
+                "decision": "pending",
+                "suggestions": [
+                    {
+                        "package": "requests",
+                        "kind": "new_suggested_dependency",
+                        "files": ["main.py"],
+                        "imports": ["requests"],
+                        "reason": "Import nuevo no declarado detectado en main.py.",
+                    }
+                ],
+                "pending_dependencies": ["requests"],
+                "approved_dependencies": [],
+                "rejected_dependencies": [],
+            }
+        )
+        self.assertIn("decision: pending", notice)
+        self.assertIn("requests", notice)
 
     def test_default_aider_instruction_includes_scope_and_files(self) -> None:
         instruction = pipeline.default_aider_instruction(
@@ -943,6 +998,7 @@ class ValidationProfileTests(unittest.TestCase):
         self.assertIn("compileall", plan.test_command)
         self.assertFalse(plan.smoke_imports)
         self.assertIn("No reproducible repo-local Python runner", " ".join(plan.promotion_blockers))
+        self.assertEqual(plan.validation_evidence_level, "mixed")
 
     def test_infer_validation_changed_files_uses_base_ref_diff(self) -> None:
         args = argparse.Namespace(base_ref="")
@@ -1005,6 +1061,7 @@ class ValidationProfileTests(unittest.TestCase):
             smoke_imports=False,
             smoke_imports_strict=False,
             smoke_import_runner=None,
+            validation_evidence_level="mixed",
             checks=[],
             context=context,
         )
@@ -1466,7 +1523,13 @@ class CommandArtifactTests(unittest.TestCase):
     def test_cmd_run_relies_on_validation_plan_instead_of_raw_test_cmd(self, _mock_preflight: mock.Mock) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
+            pipeline.run_cmd(["git", "init"], cwd=repo, check=True)
+            pipeline.run_cmd(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+            pipeline.run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
             (repo / "PROJECT_GOALS.md").write_text("- keep stable\n", encoding="utf-8")
+            (repo / "README.md").write_text("demo\n", encoding="utf-8")
+            pipeline.run_cmd(["git", "add", "."], cwd=repo, check=True)
+            pipeline.run_cmd(["git", "commit", "-m", "initial"], cwd=repo, check=True)
             args = argparse.Namespace(
                 repo=str(repo),
                 ai_dir="AI",
@@ -1513,6 +1576,7 @@ class CommandArtifactTests(unittest.TestCase):
                 smoke_imports=False,
                 smoke_imports_strict=False,
                 smoke_import_runner=None,
+                validation_evidence_level="mixed",
                 checks=[],
                 context=pipeline.ValidationContext(
                     is_python_repo=True,
@@ -1543,6 +1607,42 @@ class CommandArtifactTests(unittest.TestCase):
                 with mock.patch("molde_maestro.pipeline.run_plan_generation", side_effect=RuntimeError("stop after validation")):
                     with self.assertRaisesRegex(RuntimeError, "stop after validation"):
                         pipeline.cmd_run(args)
+
+    def test_initialize_git_run_context_generates_ai_branch_and_uses_original_as_base(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            pipeline.run_cmd(["git", "init"], cwd=repo, check=True)
+            pipeline.run_cmd(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+            pipeline.run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+            (repo / "README.md").write_text("demo\n", encoding="utf-8")
+            pipeline.run_cmd(["git", "add", "."], cwd=repo, check=True)
+            pipeline.run_cmd(["git", "commit", "-m", "initial"], cwd=repo, check=True)
+            args = argparse.Namespace(base="", base_ref="", branch="", allow_dirty_repo=False, unsafe_shell=False, cmd="run")
+            ctx = pipeline.initialize_git_run_context(repo, args, "- improve login")
+        self.assertEqual(ctx.original_branch, "master")
+        self.assertEqual(ctx.base_ref, "master")
+        self.assertTrue((ctx.work_branch or "").startswith("ai/"))
+
+    def test_render_run_completion_summary_includes_branch_commands(self) -> None:
+        summary = pipeline.render_run_completion_summary(
+            final_status="warning",
+            original_branch="feature/login-cleanup",
+            work_branch="ai/20260310-demo",
+            base_ref="feature/login-cleanup",
+            changed_files=["src/app/main.py"],
+            ai_dir=Path("/tmp/repo/AI"),
+            dependency_report={
+                "dependency_changes_detected": True,
+                "decision": "pending",
+                "suggestions": [],
+                "pending_dependencies": ["requests"],
+                "approved_dependencies": [],
+                "rejected_dependencies": [],
+            },
+        )
+        self.assertIn("git switch feature/login-cleanup", summary)
+        self.assertIn("git merge ai/20260310-demo", summary)
+        self.assertIn("requests", summary)
 
 
 class TestReportTests(unittest.TestCase):

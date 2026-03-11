@@ -66,6 +66,7 @@ class ValidationPlan:
     smoke_imports: bool
     smoke_imports_strict: bool
     smoke_import_runner: Optional[str]
+    validation_evidence_level: str
     checks: list[dict[str, Any]]
     context: ValidationContext
 
@@ -100,6 +101,7 @@ class TestReportSummary(TypedDict):
     smoke_imports: dict[str, Any]
     checks: list[ValidationCheck]
     status: str
+    validation_evidence_level: str
 
 
 def build_validation_check(
@@ -633,6 +635,16 @@ def resolve_validation_plan(repo: Path, args, *, detect_validation_context_fn=de
     semantic_timeout = int(getattr(args, "semantic_validation_timeout", 60) or 60)
     smoke_imports = profile in {"python_repo", "strict"} and context.runner_reproducible and context.runner_usable and bool(context.python_runner)
     smoke_imports_strict = profile == "strict"
+    if "pytest" in test_command or "unittest" in test_command:
+        validation_evidence_level = "functional_tests"
+    elif "compileall" in test_command and (semantic_enabled or smoke_imports):
+        validation_evidence_level = "mixed"
+    elif "compileall" in test_command:
+        validation_evidence_level = "compile_only"
+    elif semantic_enabled:
+        validation_evidence_level = "semantic_only"
+    else:
+        validation_evidence_level = "mixed"
     checks = [
         {"name": "test_command", "level": 1, "blocking": True, "status": "pending", "planned": bool(test_command)},
         {"name": "semantic_ast", "level": 2, "blocking": semantic_strict, "status": "pending" if semantic_enabled else "skipped", "planned": semantic_enabled},
@@ -656,6 +668,7 @@ def resolve_validation_plan(repo: Path, args, *, detect_validation_context_fn=de
         smoke_imports=smoke_imports,
         smoke_imports_strict=smoke_imports_strict,
         smoke_import_runner=context.python_runner if smoke_imports else None,
+        validation_evidence_level=validation_evidence_level,
         checks=checks,
         context=context,
     )
@@ -689,6 +702,7 @@ def validation_plan_to_dict(plan: ValidationPlan) -> dict[str, Any]:
             "strict": plan.smoke_imports_strict,
             "runner": plan.smoke_import_runner,
         },
+        "validation_evidence_level": plan.validation_evidence_level,
         "checks": plan.checks,
         "context": dataclasses.asdict(plan.context),
     }
@@ -763,6 +777,7 @@ def write_test_report(
         },
         "checks": [],
         "status": "failed",
+        "validation_evidence_level": "mixed",
     }
     if validation_plan is None:
         validation_context = detect_validation_context_fn(repo)
@@ -783,6 +798,7 @@ def write_test_report(
             smoke_imports=False,
             smoke_imports_strict=False,
             smoke_import_runner=None,
+            validation_evidence_level="mixed",
             checks=[],
             context=validation_context,
         )
@@ -790,6 +806,7 @@ def write_test_report(
     lint_cmd = validation_plan.lint_command
     test_cmd = validation_plan.test_command
     summary["validation_profile"] = validation_plan_to_dict(validation_plan)
+    summary["validation_evidence_level"] = validation_plan.validation_evidence_level
 
     def run_and_capture(label: str, cmd: str) -> CommandExecutionResult:
         use_shell = looks_like_shell_command(cmd)
@@ -855,6 +872,7 @@ def write_test_report(
     md_parts.append(f"- stage_status: **{summary['status']}**\n")
     md_parts.append(f"- semantic_validation_status: **{semantic_summary['status']}**\n")
     md_parts.append(f"- validation_profile: **{validation_plan.profile}** ({validation_plan.source})\n")
+    md_parts.append(f"- validation_evidence_level: **{validation_plan.validation_evidence_level}**\n")
     md_parts.append(f"- suggested_profile: **{validation_plan.suggested_profile}**\n")
     md_parts.append(f"- profile_reason: {validation_plan.suggestion_reason}\n")
     md_parts.append(f"- promotion_decision: **{validation_plan.promotion_decision}**\n")

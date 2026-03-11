@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import shutil
-import shlex
 from pathlib import Path
 
 from .utils import run_cmd, truncate
@@ -9,7 +8,11 @@ from .utils import run_cmd, truncate
 
 NOISE_ARTIFACT_BASENAMES = {".DS_Store"}
 NOISE_ARTIFACT_SUFFIXES = {".pyc", ".pyo"}
-NOISE_ARTIFACT_DIRS = {"__pycache__"}
+NOISE_ARTIFACT_DIRS = {"__pycache__", "build", "dist"}
+
+
+def _is_egg_info_path(candidate: Path) -> bool:
+    return any(part.endswith(".egg-info") for part in candidate.parts)
 
 
 def is_git_repo(repo: Path) -> bool:
@@ -79,11 +82,26 @@ def git_changed_files_between(repo: Path, base_ref: str, head_ref: str = "HEAD")
 
 
 def git_checkout(repo: Path, branch: str) -> None:
-    run_cmd(f"git checkout {shlex.quote(branch)}", cwd=repo, check=True)
+    run_cmd(["git", "checkout", branch], cwd=repo, check=True)
 
 
 def git_create_branch(repo: Path, branch_name: str) -> None:
-    run_cmd(f"git checkout -b {shlex.quote(branch_name)}", cwd=repo, check=True)
+    run_cmd(["git", "checkout", "-b", branch_name], cwd=repo, check=True)
+
+
+def git_switch(repo: Path, branch: str) -> None:
+    run_cmd(["git", "switch", branch], cwd=repo, check=True)
+
+
+def git_switch_or_checkout(repo: Path, branch: str) -> None:
+    code, _, _ = run_cmd(["git", "switch", branch], cwd=repo, capture=True)
+    if code == 0:
+        return
+    git_checkout(repo, branch)
+
+
+def git_create_or_reset_branch(repo: Path, branch_name: str, start_point: str) -> None:
+    run_cmd(["git", "checkout", "-B", branch_name, start_point], cwd=repo, check=True)
 
 
 def git_status_porcelain(repo: Path) -> str:
@@ -102,6 +120,8 @@ def is_noise_artifact_path(path: str) -> bool:
     if candidate.suffix in NOISE_ARTIFACT_SUFFIXES:
         return True
     if any(part in NOISE_ARTIFACT_DIRS for part in candidate.parts):
+        return True
+    if _is_egg_info_path(candidate):
         return True
     return False
 
@@ -185,6 +205,14 @@ def resolve_base_branch(repo: Path, requested_base: str = "") -> str:
             if git_ref_exists(repo, candidate):
                 return candidate
     return current
+
+
+def git_current_branch_or_none(repo: Path) -> str | None:
+    code, out, _ = run_cmd(["git", "branch", "--show-current"], cwd=repo, capture=True)
+    if code != 0:
+        return None
+    value = out.strip()
+    return value or None
 
 
 def infer_base_ref(repo: Path) -> str:

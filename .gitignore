@@ -17,6 +17,7 @@ dist/
 .wheels/
 pip-wheel-metadata/
 *.whl
+*.egg-info/
 
 # --- Tooling caches ---
 .pytest_cache/
@@ -30,6 +31,7 @@ htmlcov/
 
 # --- OS / editor ---
 .DS_Store
+__MACOSX/
 .idea/
 .vscode/
 *.swp

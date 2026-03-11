@@ -119,6 +119,7 @@ def merge_config_into_args(args: argparse.Namespace, cfg: dict) -> argparse.Name
         "semantic_validation_mode": "semantic_validation_mode",
         "semantic_validation_strict": "semantic_validation_strict",
         "semantic_validation_timeout": "semantic_validation_timeout",
+        "unsafe_shell": "unsafe_shell",
     }
 
     for ck, af in mappings.items():
@@ -325,6 +326,7 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--aider-extra-arg", action="append", default=[], help="Argumento extra para Aider (repetible).")
         sp.add_argument("--extra-context", action="append", default=[], help="Archivo adicional de contexto para el plan.")
         sp.add_argument("--max-tree-lines", type=int, default=600, help="Máximo de líneas del árbol del repo.")
+        sp.add_argument("--unsafe-shell", action="store_true", help="Permite test_cmd/lint_cmd con shell y reasoner cmd:. Modo inseguro.")
 
     sp_snapshot = sub.add_parser("snapshot", help="Crear snapshot zip del repo.")
     add_shared(sp_snapshot)

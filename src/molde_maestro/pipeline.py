@@ -47,9 +47,12 @@ from .git_ops import (
     git_archive_zip,
     git_commit_all,
     git_current_branch,
+    git_current_branch_or_none,
+    git_create_or_reset_branch,
     git_has_working_tree_changes,
     git_head_commit,
     git_init_with_initial_commit,
+    git_switch_or_checkout,
     is_git_repo,
     git_ref_exists,
     git_status_porcelain,
@@ -168,6 +171,170 @@ class GoalsInput:
     text: str
     source: str
     path: Optional[str] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class GitRunContext:
+    original_branch: Optional[str]
+    work_branch: Optional[str]
+    base_ref: str
+    base_ref_source: str
+    head_before_run: str
+    head_after_run: Optional[str] = None
+    dirty_repo_allowed: bool = False
+    unsafe_shell: bool = False
+
+
+def slugify_branch_hint(value: str) -> str:
+    normalized = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip().lower())
+    normalized = normalized.strip("-.")
+    return normalized[:32] or "run"
+
+
+def generated_ai_branch_name(args, goals_text: str = "") -> str:
+    hint_source = ""
+    if goals_text.strip():
+        for line in goals_text.splitlines():
+            cleaned = line.strip(" #-*\t")
+            if cleaned:
+                hint_source = cleaned
+                break
+    if not hint_source:
+        hint_source = getattr(args, "cmd", "run") or "run"
+    return f"ai/{now_stamp()}-{slugify_branch_hint(hint_source)}"
+
+
+def detect_original_branch(repo: Path) -> Optional[str]:
+    branch = git_current_branch_or_none(repo)
+    if branch:
+        return branch
+    return None
+
+
+def resolve_effective_base_ref(repo: Path, args, original_branch: Optional[str]) -> tuple[str, str]:
+    requested = str(getattr(args, "base", "") or getattr(args, "base_ref", "") or "").strip()
+    if requested:
+        if not git_ref_exists(repo, requested):
+            raise SystemExit(f"La rama/ref base no existe: {requested}")
+        return requested, "cli"
+    if original_branch and git_ref_exists(repo, original_branch):
+        return original_branch, "original_branch"
+    return infer_base_ref(repo), "auto"
+
+
+def resolve_work_branch(repo: Path, args, original_branch: Optional[str], goals_text: str = "") -> tuple[str, str]:
+    requested = str(getattr(args, "branch", "") or "").strip()
+    if requested:
+        return requested, "cli"
+    current = git_current_branch_or_none(repo)
+    if current and current.startswith("ai/") and sys.stdin.isatty():
+        terminal_ui.print_section("Rama AI detectada")
+        terminal_ui.print_status("info", f"Estas en {current}.")
+        if terminal_ui.confirm_action("¿Reutilizar esta rama de trabajo?"):
+            return current, "reuse_current_ai"
+    return generated_ai_branch_name(args, goals_text), "generated"
+
+
+def checkout_work_branch(repo: Path, branch_name: str, start_ref: str) -> None:
+    if git_ref_exists(repo, branch_name):
+        git_switch_or_checkout(repo, branch_name)
+        return
+    git_create_or_reset_branch(repo, branch_name, start_ref)
+
+
+def initialize_git_run_context(repo: Path, args, goals_text: str = "") -> GitRunContext:
+    original_branch = detect_original_branch(repo)
+    head_before_run = git_head_commit(repo)
+    base_ref, base_ref_source = resolve_effective_base_ref(repo, args, original_branch)
+    work_branch, _branch_source = resolve_work_branch(repo, args, original_branch, goals_text)
+    return GitRunContext(
+        original_branch=original_branch,
+        work_branch=work_branch,
+        base_ref=base_ref,
+        base_ref_source=base_ref_source,
+        head_before_run=head_before_run,
+        dirty_repo_allowed=bool(getattr(args, "allow_dirty_repo", False)),
+        unsafe_shell=bool(getattr(args, "unsafe_shell", False)),
+    )
+
+
+def activate_git_run_context(repo: Path, context: GitRunContext) -> GitRunContext:
+    if context.work_branch:
+        checkout_work_branch(repo, context.work_branch, context.head_before_run)
+    return context
+
+
+def attach_git_run_context(recorder: RunRecorder, context: GitRunContext) -> None:
+    recorder.metadata["original_branch"] = context.original_branch
+    recorder.metadata["work_branch"] = context.work_branch
+    recorder.metadata["base_ref"] = context.base_ref
+    recorder.metadata["base_ref_source"] = context.base_ref_source
+    recorder.metadata["head_before_run"] = context.head_before_run
+    recorder.metadata["head_after_run"] = context.head_after_run
+    recorder.metadata["dirty_repo_allowed"] = context.dirty_repo_allowed
+    recorder.metadata["unsafe_shell"] = context.unsafe_shell
+    recorder.metadata.setdefault("dependency_changes_detected", False)
+    recorder.metadata.setdefault("dependency_changes_applied", False)
+    recorder.metadata.setdefault("dependency_approval_required", False)
+    recorder.metadata.setdefault("suggested_dependencies", [])
+    recorder.metadata.setdefault("approved_dependencies", [])
+    recorder.metadata.setdefault("rejected_dependencies", [])
+    recorder.save()
+
+
+def prepare_apply_git_session(repo: Path, recorder: RunRecorder, git_ctx: GitRunContext, args) -> tuple[GitRunContext, dict[str, Any], str, str]:
+    active_branch = git_current_branch(repo)
+    prep = ensure_repo_ready_for_apply_session(repo, args)
+    git_ctx = activate_git_run_context(repo, git_ctx)
+    attach_git_run_context(recorder, git_ctx)
+    pre_apply_head = git_ctx.head_before_run
+    return git_ctx, prep, pre_apply_head, active_branch
+
+
+def persist_dependency_report(recorder: RunRecorder, dep_report: dict[str, Any]) -> None:
+    recorder.metadata["dependency_report"] = dep_report
+    recorder.metadata["dependency_changes_detected"] = dep_report.get("dependency_changes_detected", False)
+    recorder.metadata["dependency_changes_applied"] = dep_report.get("dependency_changes_applied", False)
+    recorder.metadata["dependency_approval_required"] = dep_report.get("dependency_approval_required", False)
+    recorder.metadata["suggested_dependencies"] = dep_report.get("suggested_dependencies", [])
+    recorder.metadata["approved_dependencies"] = dep_report.get("approved_dependencies", [])
+    recorder.metadata["rejected_dependencies"] = dep_report.get("rejected_dependencies", [])
+    recorder.save()
+
+
+def finalize_apply_like_command(
+    recorder: RunRecorder,
+    *,
+    final_status: str,
+    git_ctx: GitRunContext,
+    ai_dir: Path,
+    changed_files: list[str],
+    dependency_report: Optional[dict[str, Any]] = None,
+    summary_details: Optional[dict[str, Any]] = None,
+) -> None:
+    details = {
+        "work_branch": git_ctx.work_branch,
+        "original_branch": git_ctx.original_branch,
+        "base_ref": git_ctx.base_ref,
+    }
+    if summary_details:
+        details.update(summary_details)
+    recorder.complete_run(final_status, details)
+    print(
+        render_run_completion_summary(
+            final_status=final_status,
+            original_branch=git_ctx.original_branch,
+            work_branch=git_ctx.work_branch,
+            base_ref=git_ctx.base_ref,
+            changed_files=changed_files,
+            ai_dir=ai_dir,
+            dependency_report=dependency_report,
+        )
+    )
+
+
+def tracked_hygiene_violations(repo: Path) -> list[str]:
+    return tracked_noise_files(repo)
 
 
 def resolve_plan_settings(args, mode_override: Optional[str] = None) -> PlanSettings:
@@ -916,55 +1083,184 @@ def add_missing_python_dependencies(repo: Path, dependencies: list[str], strateg
     }
 
 
-def resolve_missing_python_dependencies(repo: Path, dep_audit: Dict[str, Any]) -> dict[str, Any]:
-    missing = collect_missing_python_dependencies(dep_audit)
-    strategy = detect_dependency_file_strategy(repo)
-    result: dict[str, Any] = {
-        "ok": True,
-        "missing_dependencies": missing,
-        **strategy,
+def import_name_to_package_name(import_name: str) -> str:
+    lowered = dependency_name_from_requirement(import_name)
+    reverse_aliases = {
+        alias: package_name
+        for package_name, aliases in DECLARED_DEP_ALIASES.items()
+        for alias in aliases
     }
-    if not missing:
-        result["action"] = "none"
-        return result
-    if not sys.stdin.isatty():
-        result["ok"] = False
-        result["action"] = "aborted"
-        result["reason"] = "non_interactive"
-        result["message"] = (
-            "Se detectaron dependencias externas no declaradas, pero la sesion no es interactiva. "
-            "Vuelve a correr en terminal interactiva o declara manualmente las dependencias."
+    return reverse_aliases.get(lowered, lowered)
+
+
+def detect_dependency_changes(repo: Path, changed_files: List[str], dep_audit: Dict[str, Any]) -> dict[str, Any]:
+    strategy = detect_dependency_file_strategy(repo)
+    runner, _runner_source = repo_python_runner(repo)
+    declared = declared_import_names(repo)
+    stdlib = {name.lower() for name in getattr(sys, "stdlib_module_names", set())}
+    local_roots = {name.lower() for name in local_python_import_roots(repo)}
+    suggestions: list[dict[str, Any]] = []
+    suggestion_index: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def record_suggestion(package_name: str, kind: str, file_path: str, import_name: str, reason: str, *, confidence: str = "high") -> None:
+        key = (package_name, kind)
+        entry = suggestion_index.get(key)
+        if entry is None:
+            entry = {
+                "package": package_name,
+                "kind": kind,
+                "reason": reason,
+                "files": [],
+                "imports": [],
+                "confidence": confidence,
+                "alternative": "Considera reimplementar la solucion sin libreria nueva si el cambio es pequeno." if kind == "new_suggested_dependency" else "",
+            }
+            suggestion_index[key] = entry
+            suggestions.append(entry)
+        if file_path not in entry["files"]:
+            entry["files"].append(file_path)
+        if import_name and import_name not in entry["imports"]:
+            entry["imports"].append(import_name)
+
+    for issue in dep_audit.get("issues", []):
+        file_path = str(issue.get("file") or "")
+        for missing_name in issue.get("missing_dependencies", []):
+            package_name = import_name_to_package_name(str(missing_name))
+            record_suggestion(
+                package_name,
+                "new_suggested_dependency",
+                file_path,
+                str(missing_name),
+                f"Import nuevo no declarado detectado en {file_path}.",
+            )
+
+    for rel_path in changed_files:
+        if not rel_path.endswith(".py"):
+            continue
+        source = read_text(repo / rel_path)
+        for import_root in sorted(extract_import_roots(source)):
+            lowered = import_root.lower()
+            if lowered in stdlib or lowered in local_roots or lowered not in declared:
+                continue
+            if runner and not python_module_available(runner, import_root, repo):
+                record_suggestion(
+                    import_name_to_package_name(import_root),
+                    "declared_but_not_installed",
+                    rel_path,
+                    import_root,
+                    f"El import {import_root} aparece declarado pero no se pudo importar con el runner detectado.",
+                    confidence="medium",
+                )
+
+    requires_approval = any(item["kind"] == "new_suggested_dependency" for item in suggestions)
+    suggested_dependencies = [item["package"] for item in suggestions if item["kind"] == "new_suggested_dependency"]
+    return {
+        "ok": not suggestions,
+        "dependency_changes_detected": bool(suggestions),
+        "dependency_changes_applied": False,
+        "dependency_approval_required": requires_approval,
+        "suggested_dependencies": suggested_dependencies,
+        "approved_dependencies": [],
+        "rejected_dependencies": [],
+        "pending_dependencies": suggested_dependencies[:] if requires_approval else [],
+        "uncertain_dependencies": [item["package"] for item in suggestions if item.get("confidence") != "high"],
+        "strategy": strategy,
+        "suggestions": suggestions,
+        "updated_file": None,
+        "updated_path": None,
+        "created_file": False,
+        "added_dependencies": [],
+        "decision": "none" if not suggestions else "pending",
+        "message": "" if not suggestions else "Se detectaron dependencias nuevas o no instaladas que requieren decision explicita.",
+    }
+
+
+def render_dependency_notice(dep_report: dict[str, Any]) -> str:
+    suggestions = dep_report.get("suggestions") or []
+    if not dep_report.get("dependency_changes_detected") and not suggestions:
+        return "No se detectaron cambios de dependencias."
+    lines = ["Estado de dependencias detectadas:"]
+    for suggestion in suggestions:
+        files_text = ", ".join(suggestion.get("files") or []) or "sin archivos"
+        imports_text = ", ".join(suggestion.get("imports") or []) or "sin imports"
+        lines.append(
+            f"- {suggestion['package']}: kind={suggestion['kind']} files={files_text} imports={imports_text} reason={suggestion['reason']}"
         )
-        return result
+    decision = dep_report.get("decision", "pending")
+    lines.append(f"- decision: {decision}")
+    if dep_report.get("added_dependencies"):
+        lines.append(f"- dependencias agregadas: {', '.join(dep_report['added_dependencies'])}")
+    if dep_report.get("rejected_dependencies"):
+        lines.append(f"- dependencias rechazadas: {', '.join(dep_report['rejected_dependencies'])}")
+    if dep_report.get("pending_dependencies"):
+        lines.append(f"- dependencias pendientes: {', '.join(dep_report['pending_dependencies'])}")
+    return "\n".join(lines)
 
-    terminal_ui.print_section("Dependencias faltantes")
-    terminal_ui.print_status("warn", "Se detectaron dependencias externas no declaradas introducidas durante apply.")
-    terminal_ui.print_list("Dependencias detectadas:", missing)
-    terminal_ui.print_kv_summary(
-        "Destino propuesto:",
-        {
-            "sistema": strategy["system"],
-            "archivo": strategy["target_file"],
-            "creara archivo": "si" if strategy["will_create"] else "no",
-        },
-    )
-    if strategy["will_create"]:
-        terminal_ui.print_status("info", "Se creara requirements.txt y se agregaran las dependencias detectadas.")
-        question = "¿Continuar con la creacion del archivo y el agregado?"
-    else:
-        terminal_ui.print_status("info", f"Se agregaran las dependencias a {strategy['target_file']} sin duplicados.")
-        question = f"¿Continuar con la actualizacion de {strategy['target_file']}?"
-    if not terminal_ui.confirm_action(question):
-        result["ok"] = False
-        result["action"] = "aborted"
-        result["reason"] = "rejected"
-        result["message"] = "El usuario rechazo agregar dependencias faltantes."
-        return result
 
-    update = add_missing_python_dependencies(repo, missing, strategy)
-    result.update(update)
-    result["action"] = "created" if update["created_file"] else "updated"
-    return result
+def prompt_dependency_decision(dep_report: dict[str, Any]) -> str:
+    terminal_ui.print_section("Dependencias nuevas detectadas")
+    terminal_ui.print_status("warn", "La solucion aplicada introdujo dependencias nuevas o no instaladas.")
+    for suggestion in dep_report.get("suggestions", []):
+        terminal_ui.print_status(
+            "info",
+            (
+                f"{suggestion['package']} ({suggestion['kind']}) en {', '.join(suggestion.get('files') or ['sin archivos'])}. "
+                f"Motivo: {suggestion['reason']}"
+            ),
+        )
+        if suggestion.get("alternative"):
+            terminal_ui.print_status("info", f"Alternativa: {suggestion['alternative']}")
+    terminal_ui.print_status("info", "1 = aprobar incorporacion, 2 = rechazar y continuar, 3 = abortar corrida.")
+    while True:
+        choice = input("> ").strip()
+        if choice == "1":
+            return "approved"
+        if choice == "2":
+            return "rejected"
+        if choice == "3":
+            return "aborted"
+        terminal_ui.print_status("warn", "Entrada invalida. Usa 1, 2 o 3.", stream=sys.stderr)
+
+
+def resolve_missing_python_dependencies(repo: Path, dep_audit: Dict[str, Any], changed_files: Optional[List[str]] = None) -> dict[str, Any]:
+    dep_report = detect_dependency_changes(repo, changed_files or [], dep_audit)
+    if not dep_report["dependency_changes_detected"]:
+        return dep_report
+    if not dep_report["dependency_approval_required"]:
+        dep_report["ok"] = True
+        dep_report["decision"] = "observed"
+        dep_report["message"] = "Se detectaron dependencias declaradas pero no instaladas o hallazgos no bloqueantes."
+        return dep_report
+    if not sys.stdin.isatty():
+        dep_report["ok"] = True
+        dep_report["decision"] = "pending"
+        dep_report["message"] = (
+            "Se detectaron dependencias nuevas no declaradas. En modo no interactivo no se editaran manifiestos; la decision queda pendiente."
+        )
+        return dep_report
+
+    decision = prompt_dependency_decision(dep_report)
+    dep_report["decision"] = decision
+    if decision == "aborted":
+        dep_report["ok"] = False
+        dep_report["message"] = "El usuario aborto la corrida ante dependencias nuevas."
+        return dep_report
+    if decision == "rejected":
+        dep_report["ok"] = True
+        dep_report["rejected_dependencies"] = dep_report["suggested_dependencies"][:]
+        dep_report["pending_dependencies"] = []
+        dep_report["message"] = "El usuario rechazo editar archivos de dependencias."
+        return dep_report
+
+    strategy = dep_report["strategy"]
+    update = add_missing_python_dependencies(repo, dep_report["suggested_dependencies"], strategy)
+    dep_report.update(update)
+    dep_report["dependency_changes_applied"] = bool(update.get("added_dependencies"))
+    dep_report["approved_dependencies"] = list(update.get("added_dependencies") or [])
+    dep_report["pending_dependencies"] = []
+    dep_report["ok"] = True
+    dep_report["message"] = "Dependencias nuevas aprobadas y agregadas al manifiesto."
+    return dep_report
 
 
 def reconcile_dependency_resolution(
@@ -1111,6 +1407,22 @@ FAST_PLAN_STRUCTURE = """\
 """
 
 
+def ensure_safe_command_policy(args, validation_plan: Optional[ValidationPlan] = None) -> None:
+    unsafe_shell = bool(getattr(args, "unsafe_shell", False))
+    if str(getattr(args, "reasoner", "") or "").strip().startswith("cmd:") and not unsafe_shell:
+        raise SystemExit("reasoner=cmd:... requiere --unsafe-shell.")
+    if str(getattr(args, "plan_fallback_reasoner", "") or "").strip().startswith("cmd:") and not unsafe_shell:
+        raise SystemExit("plan_fallback_reasoner=cmd:... requiere --unsafe-shell.")
+    plan = validation_plan
+    if plan is None and getattr(args, "cmd", "") in {"test", "run"}:
+        plan = resolve_validation_plan(Path(getattr(args, "repo", ".")).expanduser().resolve(), args)
+    if plan is None:
+        return
+    for label, cmd in (("test_cmd", plan.test_command), ("lint_cmd", plan.lint_command or "")):
+        if cmd and looks_like_shell_command(cmd) and not unsafe_shell:
+            raise SystemExit(f"{label} contiene metacaracteres de shell y requiere --unsafe-shell.")
+
+
 def select_plan_context_files(repo: Path, extra_context_files: List[str], max_files: int) -> List[str]:
     key_candidates = [
         "README.md",
@@ -1202,6 +1514,20 @@ def build_fallback_final_report(
     )
 
 
+def summarize_dependency_report(dep_report: Optional[dict[str, Any]]) -> list[str]:
+    if not dep_report or not dep_report.get("dependency_changes_detected"):
+        return ["- Dependency changes: none detected."]
+    lines = [
+        f"- Dependency decision: **{dep_report.get('decision', 'pending')}**.",
+        f"- Suggested dependencies: {', '.join(dep_report.get('suggested_dependencies') or ['none'])}.",
+        f"- Approved dependencies: {', '.join(dep_report.get('approved_dependencies') or ['none'])}.",
+        f"- Rejected dependencies: {', '.join(dep_report.get('rejected_dependencies') or ['none'])}.",
+    ]
+    if dep_report.get("updated_file"):
+        lines.append(f"- Updated dependency file: `{dep_report['updated_file']}`.")
+    return lines
+
+
 def build_grounded_final_report(
     metadata: Dict[str, Any],
     plan_text: str,
@@ -1226,14 +1552,20 @@ def build_grounded_final_report(
         {},
     )
     selected_titles = apply_details.get("selected_change_titles") or []
+    dependency_report = apply_details.get("dependency_resolution") or metadata.get("dependency_report")
+    original_branch = metadata.get("original_branch")
+    work_branch = metadata.get("work_branch")
+    base_ref = metadata.get("base_ref")
     selected_lines = [f"- {title}" for title in selected_titles] or ["- No selected change titles recorded."]
     test_summary_line = "- No test report was produced."
     semantic_summary_line = "- No semantic validation evidence."
     validation_profile_line = "- Validation profile not recorded."
+    validation_evidence_line = "- Validation evidence level not recorded."
     checks_line = "- Validation checks not recorded."
     promotion_line = "- Promotion decision not recorded."
     runner_line = "- Runner not recorded."
     semantic_alert = False
+    dependency_warning = bool(dependency_report and dependency_report.get("decision") in {"pending", "rejected", "aborted"})
     if test_report_md.strip():
         command_match = re.search(r"Command:\n```bash\n(.+?)\n```", test_report_md, re.DOTALL)
         match = re.search(r"- stage_status: \*\*(.+?)\*\*", test_report_md)
@@ -1241,6 +1573,7 @@ def build_grounded_final_report(
         profile_match = re.search(r"- validation_profile: \*\*(.+?)\*\*", test_report_md)
         promotion_match = re.search(r"- promotion_decision: \*\*(.+?)\*\*", test_report_md)
         runner_match = re.search(r"- runner: \*\*(.+?)\*\*", test_report_md)
+        evidence_match = re.search(r"- validation_evidence_level: \*\*(.+?)\*\*", test_report_md)
         if match:
             test_summary_line = f"- Test report status: **{match.group(1)}**."
         else:
@@ -1255,12 +1588,14 @@ def build_grounded_final_report(
             promotion_line = f"- Promotion decision: **{promotion_match.group(1)}**."
         if runner_match:
             runner_line = f"- Validation runner: **{runner_match.group(1)}**."
+        if evidence_match:
+            validation_evidence_line = f"- Validation evidence level: **{evidence_match.group(1)}**."
         checks = re.findall(r"- L(\d+) `([^`]+)`: \*\*(.+?)\*\* blocking=(True|False)", test_report_md)
         if checks:
             checks_line = "- Validation checks: " + "; ".join(f"L{level} {name}={status}" for level, name, status, _ in checks[:6]) + "."
         if command_match:
             validation_command = command_match.group(1).strip()
-    validation_evidence_line = (
+    validation_scope_line = (
         f"- Current validation only proves the repo still compiles under `{validation_command}`."
         if validation_command
         else "- Current validation evidence is limited; inspect AI/test-report.md for the exact executed command."
@@ -1273,6 +1608,9 @@ def build_grounded_final_report(
             "## Executive Summary",
             f"- Overall status: **{overall_status}**.",
             f"- Fully successful: **{'yes' if fully_successful else 'no'}**.",
+            f"- Original branch: **{original_branch or 'unknown'}**.",
+            f"- Work branch: **{work_branch or 'unknown'}**.",
+            f"- Base ref: **{base_ref or 'unknown'}**.",
             f"- Selected plan scope: {', '.join(selected_titles) if selected_titles else 'not recorded'}.",
             f"- Committed files: {', '.join(changed_files) if changed_files else 'none'}.",
             "",
@@ -1288,20 +1626,24 @@ def build_grounded_final_report(
             test_summary_line,
             semantic_summary_line,
             validation_profile_line,
+            validation_evidence_line,
             promotion_line,
             runner_line,
             checks_line,
-            validation_evidence_line,
+            validation_scope_line,
+            *summarize_dependency_report(dependency_report),
             "",
             "## Risks and Regressions",
             "- This report is grounded on metadata and git diff to avoid hallucinated success claims.",
             "- A green compile check is weaker than behavioral tests; functional regressions may still exist.",
             "- Semantic validation reported suspicious Python issues." if semantic_alert else "- No semantic validation alerts were recorded.",
+            "- Hay dependencias nuevas pendientes o rechazadas; la solucion puede requerir intervencion manual." if dependency_warning else "- No hay cambios de dependencias pendientes.",
             "- Review the actual diff before treating the change as complete.",
             "",
             "## Next Steps",
             "- Inspect the committed diff and decide whether the applied change is functionally sufficient.",
             "- Strengthen `test_cmd` when the target repo has installable dependencies or sample fixtures.",
+            "- Resolver manualmente las dependencias pendientes o reemplazar la solucion por una alternativa sin librerias nuevas." if dependency_warning else "- No dependency follow-up was recorded.",
             "- If the first plan change remains too ambitious, keep `apply` limited to one scoped change per run.",
             "",
             "## Stage Status Summary",
@@ -1315,6 +1657,67 @@ def build_grounded_final_report(
         ]
     )
 
+
+def classify_final_status(test_summary: Optional[dict[str, Any]], dep_report: Optional[dict[str, Any]] = None) -> str:
+    base_status = str((test_summary or {}).get("status", "ok") or "ok")
+    if base_status in {"failed", "timeout"}:
+        return base_status
+    evidence_level = str((test_summary or {}).get("validation_evidence_level", "") or "")
+    dep_decision = str((dep_report or {}).get("decision", "") or "")
+    if dep_decision in {"pending", "rejected", "aborted"}:
+        return "warning"
+    if base_status == "warning":
+        return "warning"
+    if evidence_level and evidence_level != "functional_tests":
+        return "warning"
+    return "ok"
+
+
+def render_run_completion_summary(
+    *,
+    final_status: str,
+    original_branch: Optional[str],
+    work_branch: Optional[str],
+    base_ref: Optional[str],
+    changed_files: list[str],
+    ai_dir: Path,
+    dependency_report: Optional[dict[str, Any]] = None,
+) -> str:
+    lines = [f"Corrida completada con {final_status}.", ""]
+    lines.append(f"Rama original: {original_branch or 'desconocida'}")
+    lines.append(f"Rama de trabajo: {work_branch or 'desconocida'}")
+    lines.append(f"Base de comparación: {base_ref or 'desconocida'}")
+    lines.append("")
+    lines.append("Archivos modificados:")
+    if changed_files:
+        lines.extend(f"- {path}" for path in changed_files[:10])
+        if len(changed_files) > 10:
+            lines.append(f"- ... y {len(changed_files) - 10} más")
+    else:
+        lines.append("- Sin cambios detectados.")
+    lines.append("")
+    lines.append("Artefactos generados:")
+    for name in ("plan.md", "test-report.md", "final.md"):
+        lines.append(f"- {ai_dir / name}")
+    lines.append("")
+    lines.append(render_dependency_notice(dependency_report or {"dependency_changes_detected": False}))
+    if original_branch:
+        lines.append("")
+        lines.append("Para volver a tu rama original:")
+        lines.append(f"  git switch {original_branch}")
+    if base_ref:
+        lines.append("")
+        lines.append("Para revisar ahora:")
+        lines.append("  git status")
+        lines.append(f"  git diff {base_ref}...HEAD")
+        lines.append(f"  cat {ai_dir / 'final.md'}")
+    if original_branch and work_branch:
+        lines.append("")
+        lines.append("Para hacer merge después de revisar:")
+        lines.append(f"  git switch {original_branch}")
+        lines.append(f"  git merge {work_branch}")
+    return "\n".join(lines)
+
 # -----------------------------
 # Validation / preflight
 # -----------------------------
@@ -1324,6 +1727,8 @@ def preflight(args, repo: Path) -> None:
 
     if not command_exists("git"):
         raise SystemExit("No se encontró 'git' en PATH.")
+
+    ensure_safe_command_policy(args)
 
     if args.cmd in {"plan", "report", "run"} and args.reasoner.strip():
         if args.cmd in {"plan", "run"}:
@@ -1348,6 +1753,7 @@ def preflight(args, repo: Path) -> None:
 
     if args.cmd in {"test", "run"}:
         validation_plan = resolve_validation_plan(repo, args)
+        ensure_safe_command_policy(args, validation_plan)
         require_nonempty(validation_plan.test_command, "validation test command", "Config: validation_profile/test_cmd")
         if not looks_like_shell_command(validation_plan.test_command):
             first = shlex.split(validation_plan.test_command)[0]
