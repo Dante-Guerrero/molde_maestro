@@ -566,6 +566,267 @@ dev = ["pytest>=8"]
         self.assertTrue(audit["ok"])
         self.assertEqual(audit["issues"], [])
 
+    def test_audit_python_dependency_declarations_allows_local_module_import(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            (repo / "main.py").write_text("import interview\n", encoding="utf-8")
+            (repo / "interview.py").write_text("def interview_guide():\n    return []\n", encoding="utf-8")
+            audit = pipeline.audit_python_dependency_declarations(repo, ["main.py"])
+        self.assertTrue(audit["ok"])
+        self.assertEqual(audit["issues"], [])
+
+    def test_audit_python_dependency_declarations_allows_local_module_from_import(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            (repo / "main.py").write_text(
+                "from interview import interview_guide\n",
+                encoding="utf-8",
+            )
+            (repo / "interview.py").write_text("def interview_guide():\n    return []\n", encoding="utf-8")
+            audit = pipeline.audit_python_dependency_declarations(repo, ["main.py"])
+        self.assertTrue(audit["ok"])
+        self.assertEqual(audit["issues"], [])
+
+    def test_audit_python_dependency_declarations_allows_local_package_import(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            (repo / "main.py").write_text("from app.helpers import greet\n", encoding="utf-8")
+            (repo / "app").mkdir()
+            (repo / "app/__init__.py").write_text("", encoding="utf-8")
+            (repo / "app/helpers.py").write_text("def greet():\n    return 'hi'\n", encoding="utf-8")
+            audit = pipeline.audit_python_dependency_declarations(repo, ["main.py"])
+        self.assertTrue(audit["ok"])
+        self.assertEqual(audit["issues"], [])
+
+    def test_audit_python_dependency_declarations_ignores_relative_imports(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            (repo / "pkg").mkdir()
+            (repo / "pkg/__init__.py").write_text("", encoding="utf-8")
+            (repo / "pkg/main.py").write_text("from .helpers import greet\n", encoding="utf-8")
+            (repo / "pkg/helpers.py").write_text("def greet():\n    return 'hi'\n", encoding="utf-8")
+            audit = pipeline.audit_python_dependency_declarations(repo, ["pkg/main.py"])
+        self.assertTrue(audit["ok"])
+        self.assertEqual(audit["issues"], [])
+
+    def test_audit_python_dependency_declarations_flags_real_external_import(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            (repo / "main.py").write_text("import requests\n", encoding="utf-8")
+            audit = pipeline.audit_python_dependency_declarations(repo, ["main.py"])
+        self.assertFalse(audit["ok"])
+        self.assertEqual(audit["issues"], [{"file": "main.py", "missing_dependencies": ["requests"]}])
+
+    def test_audit_python_dependency_declarations_ignores_stdlib_modules(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            (repo / "main.py").write_text("import os\nfrom pathlib import Path\n", encoding="utf-8")
+            audit = pipeline.audit_python_dependency_declarations(repo, ["main.py"])
+        self.assertTrue(audit["ok"])
+        self.assertEqual(audit["issues"], [])
+
+    @mock.patch("sys.stdin.isatty", return_value=True)
+    @mock.patch("builtins.input", return_value="y")
+    def test_resolve_missing_python_dependencies_updates_requirements(
+        self,
+        _mock_input: mock.Mock,
+        _mock_isatty: mock.Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            (repo / "requirements.txt").write_text("pillow\n", encoding="utf-8")
+            resolution = pipeline.resolve_missing_python_dependencies(
+                repo,
+                {"ok": False, "issues": [{"file": "main.py", "missing_dependencies": ["requests"]}]},
+            )
+            content = (repo / "requirements.txt").read_text(encoding="utf-8")
+        self.assertTrue(resolution["ok"])
+        self.assertEqual(resolution["system"], "requirements.txt")
+        self.assertEqual(resolution["updated_file"], "requirements.txt")
+        self.assertEqual(resolution["added_dependencies"], ["requests"])
+        self.assertIn("requests", content)
+
+    @mock.patch("sys.stdin.isatty", return_value=True)
+    @mock.patch("builtins.input", return_value="y")
+    def test_resolve_missing_python_dependencies_updates_pyproject(
+        self,
+        _mock_input: mock.Mock,
+        _mock_isatty: mock.Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            (repo / "pyproject.toml").write_text(
+                """
+[project]
+name = "demo"
+version = "0.1.0"
+dependencies = ["requests>=2"]
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            resolution = pipeline.resolve_missing_python_dependencies(
+                repo,
+                {"ok": False, "issues": [{"file": "main.py", "missing_dependencies": ["httpx"]}]},
+            )
+            content = (repo / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertTrue(resolution["ok"])
+        self.assertEqual(resolution["system"], "pyproject.toml")
+        self.assertEqual(resolution["updated_file"], "pyproject.toml")
+        self.assertEqual(resolution["added_dependencies"], ["httpx"])
+        self.assertIn('"httpx"', content)
+
+    @mock.patch("sys.stdin.isatty", return_value=True)
+    @mock.patch("builtins.input", return_value="y")
+    def test_resolve_missing_python_dependencies_updates_pyproject_with_extras(
+        self,
+        _mock_input: mock.Mock,
+        _mock_isatty: mock.Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            (repo / "pyproject.toml").write_text(
+                """
+[project]
+name = "demo"
+version = "0.1.0"
+dependencies = ["uvicorn[standard]>=0.30"]
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            resolution = pipeline.resolve_missing_python_dependencies(
+                repo,
+                {"ok": False, "issues": [{"file": "main.py", "missing_dependencies": ["httpx"]}]},
+            )
+            content = (repo / "pyproject.toml").read_text(encoding="utf-8")
+            parsed = pipeline.extract_dependency_names_from_pyproject(repo / "pyproject.toml")
+        self.assertTrue(resolution["ok"])
+        self.assertIn('"uvicorn[standard]>=0.30"', content)
+        self.assertIn('"httpx"', content)
+        self.assertEqual(parsed, {"uvicorn", "httpx"})
+
+    @mock.patch("sys.stdin.isatty", return_value=True)
+    @mock.patch("builtins.input", return_value="y")
+    def test_resolve_missing_python_dependencies_creates_requirements_when_missing(
+        self,
+        _mock_input: mock.Mock,
+        _mock_isatty: mock.Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            resolution = pipeline.resolve_missing_python_dependencies(
+                repo,
+                {"ok": False, "issues": [{"file": "main.py", "missing_dependencies": ["requests"]}]},
+            )
+            exists = (repo / "requirements.txt").exists()
+            content = (repo / "requirements.txt").read_text(encoding="utf-8")
+        self.assertTrue(resolution["ok"])
+        self.assertEqual(resolution["system"], "none")
+        self.assertEqual(resolution["action"], "created")
+        self.assertTrue(exists)
+        self.assertEqual(content, "requests\n")
+
+    @mock.patch("sys.stdin.isatty", return_value=True)
+    @mock.patch("builtins.input", return_value="n")
+    def test_resolve_missing_python_dependencies_rejects_user(
+        self,
+        _mock_input: mock.Mock,
+        _mock_isatty: mock.Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            (repo / "requirements.txt").write_text("", encoding="utf-8")
+            resolution = pipeline.resolve_missing_python_dependencies(
+                repo,
+                {"ok": False, "issues": [{"file": "main.py", "missing_dependencies": ["requests"]}]},
+            )
+            content = (repo / "requirements.txt").read_text(encoding="utf-8")
+        self.assertFalse(resolution["ok"])
+        self.assertEqual(resolution["reason"], "rejected")
+        self.assertEqual(content, "")
+
+    @mock.patch("sys.stdin.isatty", return_value=False)
+    def test_resolve_missing_python_dependencies_aborts_cleanly_when_non_interactive(
+        self,
+        _mock_isatty: mock.Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            (repo / "requirements.txt").write_text("", encoding="utf-8")
+            resolution = pipeline.resolve_missing_python_dependencies(
+                repo,
+                {"ok": False, "issues": [{"file": "main.py", "missing_dependencies": ["requests"]}]},
+            )
+        self.assertFalse(resolution["ok"])
+        self.assertEqual(resolution["reason"], "non_interactive")
+        self.assertEqual(resolution["action"], "aborted")
+
+    @mock.patch("sys.stdin.isatty", return_value=True)
+    @mock.patch("builtins.input", return_value="y")
+    def test_resolve_missing_python_dependencies_avoids_duplicates_on_accept(
+        self,
+        _mock_input: mock.Mock,
+        _mock_isatty: mock.Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            (repo / "requirements.txt").write_text("requests\n", encoding="utf-8")
+            resolution = pipeline.resolve_missing_python_dependencies(
+                repo,
+                {
+                    "ok": False,
+                    "issues": [
+                        {"file": "main.py", "missing_dependencies": ["requests", "httpx", "httpx"]},
+                    ],
+                },
+            )
+            content = (repo / "requirements.txt").read_text(encoding="utf-8")
+        self.assertTrue(resolution["ok"])
+        self.assertEqual(resolution["added_dependencies"], ["httpx"])
+        self.assertEqual(content, "requests\nhttpx\n")
+
+    def test_reconcile_dependency_resolution_commits_dependency_file_after_aider_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            pipeline.run_cmd(["git", "init"], cwd=repo, check=True)
+            pipeline.run_cmd(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+            pipeline.run_cmd(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+            (repo / "main.py").write_text("print('v1')\n", encoding="utf-8")
+            pipeline.run_cmd(["git", "add", "."], cwd=repo, check=True)
+            pipeline.run_cmd(["git", "commit", "-m", "initial"], cwd=repo, check=True)
+            previous_head = pipeline.git_head_commit(repo)
+
+            (repo / "main.py").write_text("print('v2')\n", encoding="utf-8")
+            pipeline.run_cmd(["git", "add", "main.py"], cwd=repo, check=True)
+            pipeline.run_cmd(["git", "commit", "-m", "feat: aider change"], cwd=repo, check=True)
+            (repo / "requirements.txt").write_text("requests\n", encoding="utf-8")
+
+            refreshed = pipeline.reconcile_dependency_resolution(
+                repo,
+                previous_head,
+                {
+                    "mode": "commit",
+                    "changed_files": ["main.py"],
+                    "commit_created": True,
+                    "head_before": previous_head,
+                    "head_after": pipeline.git_head_commit(repo),
+                },
+                {
+                    "ok": True,
+                    "updated_file": "requirements.txt",
+                    "added_dependencies": ["requests"],
+                },
+            )
+            changed_since_start = pipeline.collect_git_changed_files(repo, previous_head)
+            status = pipeline.git_status_porcelain(repo)
+        self.assertTrue(refreshed["dependency_commit_created"])
+        self.assertIsNotNone(refreshed["dependency_commit"])
+        self.assertEqual(status, "")
+        self.assertIn("main.py", changed_since_start)
+        self.assertIn("requirements.txt", changed_since_start)
+        self.assertIn("requirements.txt", refreshed["changed_files"])
+
     def test_default_aider_instruction_includes_scope_and_files(self) -> None:
         instruction = pipeline.default_aider_instruction(
             "# Repo Review Plan",

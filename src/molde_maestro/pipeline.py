@@ -680,6 +680,28 @@ def declared_import_names(repo: Path) -> set[str]:
     return names
 
 
+def local_python_import_roots(repo: Path) -> set[str]:
+    roots: set[str] = set()
+    candidate_bases = [repo]
+    src_dir = repo / "src"
+    if src_dir.exists():
+        candidate_bases.append(src_dir)
+    for base in candidate_bases:
+        if not base.exists() or not base.is_dir():
+            continue
+        for child in base.iterdir():
+            if child.name.startswith("."):
+                continue
+            if child.is_file() and child.suffix == ".py" and child.stem != "__init__":
+                roots.add(child.stem)
+                continue
+            if not child.is_dir():
+                continue
+            if base == src_dir or (child / "__init__.py").exists():
+                roots.add(child.name)
+    return roots
+
+
 def extract_import_roots(source: str) -> set[str]:
     roots: set[str] = set()
     try:
@@ -700,7 +722,7 @@ def extract_import_roots(source: str) -> set[str]:
 def audit_python_dependency_declarations(repo: Path, changed_files: List[str]) -> Dict[str, Any]:
     declared = declared_import_names(repo)
     stdlib = {name.lower() for name in getattr(sys, "stdlib_module_names", set())}
-    local_roots = {path.parts[1] for path in (repo / "src").glob("*") if path.is_dir()} if (repo / "src").exists() else set()
+    local_roots = {name.lower() for name in local_python_import_roots(repo)}
     issues: List[Dict[str, Any]] = []
     for rel_path in changed_files:
         if not rel_path.endswith(".py"):
@@ -712,7 +734,7 @@ def audit_python_dependency_declarations(repo: Path, changed_files: List[str]) -
         missing = []
         for root in sorted(imports):
             lowered = root.lower()
-            if lowered in stdlib or lowered in declared or root in local_roots:
+            if lowered in stdlib or lowered in declared or lowered in local_roots:
                 continue
             missing.append(root)
         if missing:
@@ -720,6 +742,236 @@ def audit_python_dependency_declarations(repo: Path, changed_files: List[str]) -
     return {"ok": not issues, "issues": issues}
 
 
+def collect_missing_python_dependencies(dep_audit: Dict[str, Any]) -> list[str]:
+    deps: list[str] = []
+    for issue in dep_audit.get("issues", []):
+        for raw_name in issue.get("missing_dependencies", []):
+            name = dependency_name_from_requirement(str(raw_name))
+            if name:
+                deps.append(name)
+    return list(dict.fromkeys(sorted(deps)))
+
+
+def detect_dependency_file_strategy(repo: Path) -> dict[str, Any]:
+    has_pyproject = (repo / "pyproject.toml").exists()
+    has_requirements = (repo / "requirements.txt").exists()
+    if has_pyproject and has_requirements:
+        return {
+            "system": "both",
+            "target_file": "pyproject.toml",
+            "target_path": str(repo / "pyproject.toml"),
+            "will_create": False,
+        }
+    if has_pyproject:
+        return {
+            "system": "pyproject.toml",
+            "target_file": "pyproject.toml",
+            "target_path": str(repo / "pyproject.toml"),
+            "will_create": False,
+        }
+    if has_requirements:
+        return {
+            "system": "requirements.txt",
+            "target_file": "requirements.txt",
+            "target_path": str(repo / "requirements.txt"),
+            "will_create": False,
+        }
+    return {
+        "system": "none",
+        "target_file": "requirements.txt",
+        "target_path": str(repo / "requirements.txt"),
+        "will_create": True,
+    }
+
+
+def update_requirements_file(requirements_path: Path, dependencies: list[str]) -> list[str]:
+    existing_text = requirements_path.read_text(encoding="utf-8") if requirements_path.exists() else ""
+    existing_lines = existing_text.splitlines()
+    existing_names = {
+        dependency_name_from_requirement(line)
+        for line in existing_lines
+        if line.strip() and not line.strip().startswith("#")
+    }
+    additions = [dep for dep in dependencies if dep not in existing_names]
+    if not additions:
+        return []
+    lines = list(existing_lines)
+    lines.extend(additions)
+    safe_write(requirements_path, "\n".join(lines).rstrip() + "\n")
+    return additions
+
+
+def _format_pyproject_dependency_block(dependencies: list[str]) -> str:
+    if not dependencies:
+        return "dependencies = []\n"
+    lines = ["dependencies = ["]
+    lines.extend(f'    "{dep}",' for dep in dependencies)
+    lines.append("]")
+    return "\n".join(lines) + "\n"
+
+
+def _find_toml_array_end(text: str, start_index: int) -> int:
+    if start_index < 0 or start_index >= len(text) or text[start_index] != "[":
+        raise ExecutionFailure("Invalid TOML array start while updating pyproject.toml.")
+    depth = 0
+    quote_char = ""
+    escape = False
+    for index in range(start_index, len(text)):
+        char = text[index]
+        if quote_char:
+            if quote_char == '"':
+                if escape:
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                elif char == quote_char:
+                    quote_char = ""
+            elif char == quote_char:
+                quote_char = ""
+            continue
+        if char in {'"', "'"}:
+            quote_char = char
+            continue
+        if char == "[":
+            depth += 1
+            continue
+        if char == "]":
+            depth -= 1
+            if depth == 0:
+                return index
+    raise ExecutionFailure("Could not find the end of project.dependencies in pyproject.toml.")
+
+
+def _append_pyproject_dependency_items(items: str, additions: list[str]) -> str:
+    rendered_additions = [f'"{dep}"' for dep in additions]
+    if "\n" in items:
+        trailing_ws_len = len(items) - len(items.rstrip())
+        trailing_ws = items[-trailing_ws_len:] if trailing_ws_len else ""
+        content = items[:-trailing_ws_len] if trailing_ws_len else items
+        indent_match = re.search(r"(?m)^(\s*)['\"]", content)
+        indent = indent_match.group(1) if indent_match else "    "
+        if content and not content.endswith("\n"):
+            content += "\n"
+        content += "".join(f"{indent}{item},\n" for item in rendered_additions)
+        return content + trailing_ws
+    stripped = items.strip()
+    if not stripped:
+        return ", ".join(rendered_additions)
+    return f"{stripped}, {', '.join(rendered_additions)}"
+
+
+def update_pyproject_dependencies(pyproject_path: Path, dependencies: list[str]) -> list[str]:
+    text = pyproject_path.read_text(encoding="utf-8")
+    parsed_dependencies = extract_dependency_names_from_pyproject(pyproject_path)
+    additions = [dep for dep in dependencies if dep not in parsed_dependencies]
+    if not additions:
+        return []
+    if "[project]" not in text:
+        suffix = "" if not text.strip() else "\n\n"
+        text = text.rstrip() + suffix + "[project]\n" + _format_pyproject_dependency_block(additions)
+        safe_write(pyproject_path, text.rstrip() + "\n")
+        return additions
+
+    section_match = re.search(r"(?ms)^\[project\]\n(?P<body>.*?)(?=^\[|\Z)", text)
+    if not section_match:
+        raise ExecutionFailure("Could not locate [project] section in pyproject.toml.")
+
+    body = section_match.group("body")
+    dependency_match = re.search(r"(?m)^dependencies\s*=\s*\[", body)
+    if dependency_match:
+        array_start = body.find("[", dependency_match.start())
+        if array_start < 0:
+            raise ExecutionFailure("Could not locate project.dependencies array in pyproject.toml.")
+        array_end = _find_toml_array_end(body, array_start)
+        items = body[array_start + 1:array_end]
+        updated_items = _append_pyproject_dependency_items(items, additions)
+        replacement = f"dependencies = [{updated_items}]"
+        new_body = body[:dependency_match.start()] + replacement + body[array_end + 1:]
+    else:
+        dependency_block = _format_pyproject_dependency_block(additions)
+        new_body = dependency_block + body
+
+    new_section = "[project]\n" + new_body
+    new_text = text[:section_match.start()] + new_section + text[section_match.end():]
+    safe_write(pyproject_path, new_text.rstrip() + "\n")
+    return additions
+
+
+def add_missing_python_dependencies(repo: Path, dependencies: list[str], strategy: dict[str, Any]) -> dict[str, Any]:
+    target_file = strategy["target_file"]
+    target_path = repo / target_file
+    if target_file == "pyproject.toml":
+        added = update_pyproject_dependencies(target_path, dependencies)
+    else:
+        added = update_requirements_file(target_path, dependencies)
+    return {
+        "updated_file": target_file,
+        "updated_path": str(target_path),
+        "added_dependencies": added,
+        "created_file": bool(strategy.get("will_create") and target_path.exists()),
+    }
+
+
+def resolve_missing_python_dependencies(repo: Path, dep_audit: Dict[str, Any]) -> dict[str, Any]:
+    missing = collect_missing_python_dependencies(dep_audit)
+    strategy = detect_dependency_file_strategy(repo)
+    result: dict[str, Any] = {
+        "ok": True,
+        "missing_dependencies": missing,
+        **strategy,
+    }
+    if not missing:
+        result["action"] = "none"
+        return result
+    if not sys.stdin.isatty():
+        result["ok"] = False
+        result["action"] = "aborted"
+        result["reason"] = "non_interactive"
+        return result
+
+    print("Se detectaron dependencias externas no declaradas introducidas durante apply:")
+    for dep in missing:
+        print(f"- {dep}")
+    print(f"Sistema de dependencias detectado: {strategy['system']}")
+    if strategy["will_create"]:
+        question = "No se encontró archivo de dependencias. ¿Quieres crear requirements.txt y agregarlas? [y/N] "
+    else:
+        question = f"¿Quieres agregarlas a {strategy['target_file']}? [y/N] "
+    answer = input(question).strip().lower()
+    if answer not in {"y", "yes", "s", "si"}:
+        result["ok"] = False
+        result["action"] = "aborted"
+        result["reason"] = "rejected"
+        return result
+
+    update = add_missing_python_dependencies(repo, missing, strategy)
+    result.update(update)
+    result["action"] = "created" if update["created_file"] else "updated"
+    return result
+
+
+def reconcile_dependency_resolution(
+    repo: Path,
+    previous_head: str,
+    aider_result: dict[str, Any],
+    dep_resolution: dict[str, Any],
+    commit_message: str = "chore: declare added Python dependencies",
+) -> dict[str, Any]:
+    dep_file = str(dep_resolution.get("updated_file") or "").strip()
+    dependency_commit = None
+    if dep_file and dep_resolution.get("added_dependencies") and aider_result.get("commit_created"):
+        working_tree_files = set(collect_working_tree_changed_files(repo))
+        if dep_file in working_tree_files:
+            dependency_commit = git_commit_paths(repo, commit_message, [dep_file])
+    refreshed = collect_aider_result(repo, previous_head)
+    changed_files = list(refreshed.get("changed_files", []))
+    if dep_file and dep_file not in changed_files:
+        if (repo / dep_file).exists():
+            changed_files.append(dep_file)
+    refreshed["changed_files"] = changed_files
+    refreshed["dependency_commit"] = dependency_commit
+    refreshed["dependency_commit_created"] = dependency_commit is not None
+    return refreshed
 
 
 def change_dependency_refs(change: PlanChange) -> List[str]:

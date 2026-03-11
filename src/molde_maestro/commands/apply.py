@@ -113,13 +113,38 @@ def cmd_apply(args) -> None:
             dep_audit = core.audit_python_dependency_declarations(repo, changed_files)
             details["dependency_audit"] = dep_audit
             if not dep_audit["ok"]:
-                raise core.ExecutionFailure(
-                    "Aider introduced Python imports whose dependencies are not declared in the repo.",
-                    command=f"aider --model {core.normalize_aider_model_name(config.aider_model)}",
-                    stdout=stdout,
-                    stderr=json.dumps(dep_audit, ensure_ascii=False),
-                    status="failed",
-                )
+                dep_resolution = core.resolve_missing_python_dependencies(repo, dep_audit)
+                details["dependency_resolution"] = dep_resolution
+                if not dep_resolution["ok"]:
+                    raise core.ExecutionFailure(
+                        "Aider introduced Python imports whose dependencies are not declared in the repo.",
+                        command=f"aider --model {core.normalize_aider_model_name(config.aider_model)}",
+                        stdout=stdout,
+                        stderr=json.dumps(
+                            {
+                                "dependency_audit": dep_audit,
+                                "dependency_resolution": dep_resolution,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        status="failed",
+                    )
+                aider_result = core.reconcile_dependency_resolution(repo, pre_apply_head, aider_result, dep_resolution)
+                changed_files = aider_result["changed_files"]
+                details["aider_result_mode"] = aider_result["mode"]
+                details["aider_commit_created"] = aider_result["commit_created"]
+                details["head_after_apply"] = aider_result["head_after"]
+                details["dependency_resolution_commit"] = aider_result.get("dependency_commit")
+                dep_audit = core.audit_python_dependency_declarations(repo, changed_files)
+                details["dependency_audit"] = dep_audit
+                if not dep_audit["ok"]:
+                    raise core.ExecutionFailure(
+                        "Dependency update did not resolve undeclared Python imports.",
+                        command=f"aider --model {core.normalize_aider_model_name(config.aider_model)}",
+                        stdout=stdout,
+                        stderr=json.dumps(dep_audit, ensure_ascii=False),
+                        status="failed",
+                    )
             details["changed_files"] = changed_files
             print(f"apply: aider return code = {rc}")
             print(core.explain_completed_changes(details["selected_change_titles"], changed_files))
