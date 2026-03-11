@@ -9,6 +9,7 @@ import datetime as dt
 from pathlib import Path
 from typing import Any, Optional, TypedDict
 
+from . import terminal_ui
 from .utils import ExecutionFailure, ensure_ai_dir, format_duration, iso_now, safe_unlink, safe_write, to_text, truncate
 
 
@@ -101,7 +102,7 @@ class RunRecorder:
         stage["status"] = "running"
         self._started_perf[name] = dt.datetime.now().timestamp()
         self.save()
-        print(f"[{name}] started at {stage['start_time']}")
+        terminal_ui.print_status("info", f"[{name}] Iniciando")
 
     def finish_stage(self, name: str, status: str, details: Optional[dict[str, Any]] = None) -> None:
         stage = self._stage(name)
@@ -113,7 +114,8 @@ class RunRecorder:
         if details:
             stage["details"].update(details)
         self.save()
-        print(f"[{name}] {status} in {format_duration(stage['duration_seconds'])}")
+        kind = "ok" if status == "ok" else "warn" if status in {"warning", "skipped"} else "error"
+        terminal_ui.print_status(kind, f"[{name}] {status.upper()} en {format_duration(stage['duration_seconds'])}")
 
     def mark_stage_skipped(self, name: str, reason: str) -> None:
         stage = self._stage(name)
@@ -124,7 +126,7 @@ class RunRecorder:
         stage["end_time"] = stage["start_time"]
         stage["duration_seconds"] = 0.0
         self.save()
-        print(f"[{name}] skipped ({reason})")
+        terminal_ui.print_status("warn", f"[{name}] SKIPPED ({reason})")
 
     def fail_run(self, message: str, status: str = "failed", details: Optional[dict[str, Any]] = None) -> None:
         self.metadata["status"] = status

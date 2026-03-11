@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .. import pipeline as core
 from ..command_config import ApplyCommandConfig
+from .. import terminal_ui
 
 
 def cmd_apply(args) -> None:
@@ -77,6 +78,15 @@ def cmd_apply(args) -> None:
             details["cleaned_tracked_noise_files"] = prep["cleaned_tracked_noise_files"]
             details["preexisting_commit"] = prep["preexisting_commit"]
             details["stdout_excerpt"] = core.truncate(stdout, 2000)
+            if apply_scope.selected_files:
+                terminal_ui.print_kv_summary(
+                    "Scope de apply:",
+                    {
+                        "source": apply_scope.source,
+                        "archivos seleccionados": len(apply_scope.selected_files),
+                        "cambios seleccionados": len(apply_scope.selected_changes),
+                    },
+                )
             if rc != 0 or core.aider_output_has_fatal_error(stdout, err):
                 raise core.ExecutionFailure(
                     f"Aider failed ({rc}).",
@@ -146,7 +156,7 @@ def cmd_apply(args) -> None:
                         status="failed",
                     )
             details["changed_files"] = changed_files
-            print(f"apply: aider return code = {rc}")
+            terminal_ui.print_status("info", f"Aider finalizo con codigo {rc}")
             print(core.explain_completed_changes(details["selected_change_titles"], changed_files))
             commit_sha = None
             if not aider_result["commit_created"]:
@@ -165,6 +175,6 @@ def cmd_apply(args) -> None:
             "timeout" if isinstance(exc, core.ExecutionFailure) and exc.status == "timeout" else "failed",
             {"stage": "apply", "error_path": str(error_path)},
         )
-        print(f"apply: failed. See {error_path}")
+        terminal_ui.print_human_error_summary("apply", str(exc), error_path, hint="Revisa el artefacto de error para el detalle tecnico.")
         raise
     recorder.complete_run("ok", {"plan_path": str(plan_path)})

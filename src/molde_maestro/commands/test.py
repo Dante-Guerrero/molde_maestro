@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .. import pipeline as core
 from ..command_config import TestCommandConfig
+from .. import terminal_ui
 
 
 def cmd_test(args) -> None:
@@ -35,7 +36,8 @@ def cmd_test(args) -> None:
             details["changed_files"] = changed_files
             details["validation_profile"] = summary["validation_profile"]
             details["summary"] = summary
-            print(f"test: passed={passed} (report in {ai_dir / 'test-report.md'})")
+            kind = "ok" if passed else "warn"
+            terminal_ui.print_status(kind, f"Validacion completada. Reporte: {ai_dir / 'test-report.md'}")
     except BaseException as exc:
         error_path = core.write_stage_error(ai_dir, "test", exc, {"test_timeout": config.test_timeout})
         recorder.fail_run(
@@ -43,7 +45,7 @@ def cmd_test(args) -> None:
             "timeout" if isinstance(exc, core.ExecutionFailure) and exc.status == "timeout" else "failed",
             {"stage": "test", "error_path": str(error_path)},
         )
-        print(f"test: failed. See {error_path}")
+        terminal_ui.print_human_error_summary("test", str(exc), error_path, hint="Revisa el reporte y el artefacto de error.")
         raise
     recorder.complete_run(summary["status"], {"passed": passed, "test_report": str(ai_dir / "test-report.md"), "validation_profile": validation_plan.profile})
     if not passed:

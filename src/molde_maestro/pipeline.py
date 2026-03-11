@@ -87,6 +87,7 @@ from .reporting import (
     record_stage,
     write_stage_error,
 )
+from . import terminal_ui
 from .utils import (
     ExecutionFailure,
     command_exists,
@@ -294,11 +295,11 @@ def confirm_noise_cleanup(repo: Path, label: str, paths: list[str]) -> bool:
         )
     sample = ", ".join(paths[:5])
     extra = "" if len(paths) <= 5 else f" ... (+{len(paths) - 5} más)"
-    answer = input(
-        f"Se detectaron artefactos generados para limpiar ({label}) en {repo}: {sample}{extra}. "
-        "¿Quieres limpiarlos ahora? [y/N] "
-    ).strip().lower()
-    return answer in {"y", "yes"}
+    terminal_ui.print_section("Limpieza sugerida")
+    terminal_ui.print_status("warn", f"Se detectaron artefactos generados ({label}) en {repo}.")
+    terminal_ui.print_status("info", f"Muestra: {sample}{extra}")
+    terminal_ui.print_status("info", "Se eliminaran solo artefactos generados detectados.")
+    return terminal_ui.confirm_action("¿Continuar con la limpieza?")
 
 
 def format_changed_files_summary(paths: list[str], limit: int = 10) -> str:
@@ -322,9 +323,9 @@ def filter_user_visible_paths(paths: list[str], ai_dir_name: str = "AI") -> list
 
 
 def explain_completed_changes(selected_titles: list[str], changed_files: list[str], test_status: Optional[str] = None) -> str:
-    lines = ["Cambios detectados:"]
+    lines = ["Resumen de cambios:"]
     if selected_titles:
-        lines.append("Cambios planificados aplicados:")
+        lines.append("Cambios aplicados:")
         lines.extend(f"- {title}" for title in selected_titles)
     if changed_files:
         lines.append("Archivos modificados:")
@@ -347,13 +348,13 @@ def generated_commit_message(prefix: str, selected_titles: list[str]) -> str:
 def confirm_and_commit_changes(repo: Path, prompt: str, commit_message: str, changed_files: list[str]) -> Optional[str]:
     if not changed_files or not sys.stdin.isatty():
         return None
-    print(prompt)
-    print(format_changed_files_summary(changed_files))
-    reply = input("¿Deseas crear un commit? [y/N]: ").strip().lower()
-    if reply not in {"y", "yes", "s", "si"}:
+    terminal_ui.print_section("Commit sugerido")
+    terminal_ui.print_status("info", prompt)
+    terminal_ui.print_list("Archivos incluidos:", changed_files)
+    if not terminal_ui.confirm_action("¿Continuar con el commit?"):
         return None
     commit_sha = git_commit_paths(repo, commit_message, changed_files)
-    print(f"git: commit creado -> {commit_sha}")
+    terminal_ui.print_status("ok", f"Commit creado: {commit_sha}")
     return commit_sha
 
 
@@ -379,8 +380,9 @@ def ensure_repo_ready_for_apply_session(repo: Path, args, *, tracked_noise: Opti
             "Haz commit/stash primero o activa --allow-dirty-repo."
         )
 
-    print("Se detectaron cambios antes de aplicar el plan:")
-    print(format_changed_files_summary(dirty_files))
+    terminal_ui.print_section("Repo con cambios previos")
+    terminal_ui.print_status("warn", "Se detectaron cambios antes de aplicar el plan.")
+    terminal_ui.print_list("Archivos detectados:", dirty_files)
     commit_sha = confirm_and_commit_changes(
         repo,
         "Molde Maestro recomienda guardar el estado actual antes de modificar la rama activa.",
@@ -455,11 +457,13 @@ def ensure_git_repo_ready(repo: Path) -> None:
         return
     if not sys.stdin.isatty():
         raise SystemExit(f"No es un repo git válido: {repo}")
-    answer = input(f"El repositorio objetivo no tiene git inicializado ({repo}). ¿Quieres crearlo ahora? [y/N] ").strip().lower()
-    if answer not in {"y", "yes", "s", "si"}:
+    terminal_ui.print_section("Repositorio sin git")
+    terminal_ui.print_status("warn", f"El repositorio objetivo no tiene git inicializado: {repo}")
+    terminal_ui.print_status("info", "Se creara un repo git con commit inicial.")
+    if not terminal_ui.confirm_action("¿Continuar con la inicializacion?"):
         raise SystemExit("Operación cancelada: el repo objetivo no tiene git.")
     commit_sha = git_init_with_initial_commit(repo)
-    print(f"git: repositorio inicializado -> {commit_sha}")
+    terminal_ui.print_status("ok", f"Repositorio git inicializado: {commit_sha}")
 
 
 def build_reasoner_prompt(
@@ -927,21 +931,34 @@ def resolve_missing_python_dependencies(repo: Path, dep_audit: Dict[str, Any]) -
         result["ok"] = False
         result["action"] = "aborted"
         result["reason"] = "non_interactive"
+        result["message"] = (
+            "Se detectaron dependencias externas no declaradas, pero la sesion no es interactiva. "
+            "Vuelve a correr en terminal interactiva o declara manualmente las dependencias."
+        )
         return result
 
-    print("Se detectaron dependencias externas no declaradas introducidas durante apply:")
-    for dep in missing:
-        print(f"- {dep}")
-    print(f"Sistema de dependencias detectado: {strategy['system']}")
+    terminal_ui.print_section("Dependencias faltantes")
+    terminal_ui.print_status("warn", "Se detectaron dependencias externas no declaradas introducidas durante apply.")
+    terminal_ui.print_list("Dependencias detectadas:", missing)
+    terminal_ui.print_kv_summary(
+        "Destino propuesto:",
+        {
+            "sistema": strategy["system"],
+            "archivo": strategy["target_file"],
+            "creara archivo": "si" if strategy["will_create"] else "no",
+        },
+    )
     if strategy["will_create"]:
-        question = "No se encontró archivo de dependencias. ¿Quieres crear requirements.txt y agregarlas? [y/N] "
+        terminal_ui.print_status("info", "Se creara requirements.txt y se agregaran las dependencias detectadas.")
+        question = "¿Continuar con la creacion del archivo y el agregado?"
     else:
-        question = f"¿Quieres agregarlas a {strategy['target_file']}? [y/N] "
-    answer = input(question).strip().lower()
-    if answer not in {"y", "yes", "s", "si"}:
+        terminal_ui.print_status("info", f"Se agregaran las dependencias a {strategy['target_file']} sin duplicados.")
+        question = f"¿Continuar con la actualizacion de {strategy['target_file']}?"
+    if not terminal_ui.confirm_action(question):
         result["ok"] = False
         result["action"] = "aborted"
         result["reason"] = "rejected"
+        result["message"] = "El usuario rechazo agregar dependencias faltantes."
         return result
 
     update = add_missing_python_dependencies(repo, missing, strategy)

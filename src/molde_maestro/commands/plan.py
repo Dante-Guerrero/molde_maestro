@@ -4,6 +4,7 @@ from pathlib import Path
 
 from .. import pipeline as core
 from ..command_config import PlanCommandConfig
+from .. import terminal_ui
 
 
 def cmd_plan(args) -> None:
@@ -30,7 +31,7 @@ def cmd_plan(args) -> None:
             details["goals_source"] = goals_input.source
             details["goals_path"] = goals_input.path
             details.update(plan_meta)
-            print(f"plan: wrote {plan_out}")
+            terminal_ui.print_status("ok", f"Plan generado: {plan_out}")
     except BaseException as exc:
         error_path = core.write_stage_error(
             ai_dir,
@@ -49,6 +50,6 @@ def cmd_plan(args) -> None:
             "timeout" if isinstance(exc, core.ExecutionFailure) and exc.status == "timeout" else "failed",
             {"stage": "plan", "error_path": str(error_path)},
         )
-        print(f"plan: failed. See {error_path}")
+        terminal_ui.print_human_error_summary("plan", str(exc), error_path, hint="Revisa el artefacto de error para el detalle completo.")
         raise
     recorder.complete_run("ok", {"plan_path": str(plan_out)})

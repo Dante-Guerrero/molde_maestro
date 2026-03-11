@@ -6,6 +6,7 @@ from typing import Any
 
 from .. import pipeline as core
 from ..command_config import RunCommandConfig
+from .. import terminal_ui
 
 
 def cmd_run(args) -> None:
@@ -22,7 +23,7 @@ def cmd_run(args) -> None:
             out_zip = ai_dir / "snapshots" / f"{core.now_stamp()}.zip"
             core.git_archive_zip(repo, out_zip)
             details["artifact"] = str(out_zip)
-            print(f"run: snapshot zip -> {out_zip}")
+            terminal_ui.print_status("ok", f"Snapshot generado: {out_zip}")
     else:
         recorder.mark_stage_skipped("snapshot", "zip_disabled")
 
@@ -37,7 +38,7 @@ def cmd_run(args) -> None:
             details["goals_source"] = goals_input.source
             details["goals_path"] = goals_input.path
             details.update(plan_meta)
-            print(f"run: plan -> {ai_dir / 'plan.md'}")
+            terminal_ui.print_status("ok", f"Plan generado: {ai_dir / 'plan.md'}")
 
         validation_plan = core.resolve_validation_plan(repo, config._raw_args)
         lint_cmd = validation_plan.lint_command
@@ -54,7 +55,7 @@ def cmd_run(args) -> None:
             prep = core.ensure_repo_ready_for_apply_session(repo, config._raw_args)
             pre_apply_head = core.git_head_commit(repo)
             if prep["cleaned_tracked_noise_files"]:
-                print(f"run: cleaned tracked generated artifacts -> {', '.join(prep['cleaned_tracked_noise_files'])}")
+                terminal_ui.print_status("info", f"Artefactos limpiados: {', '.join(prep['cleaned_tracked_noise_files'])}")
 
             core.ensure_repo_ready_for_aider(repo)
 
@@ -95,6 +96,15 @@ def cmd_run(args) -> None:
             details["skipped_change_titles"] = apply_scope.skipped_change_titles
             details["cleaned_tracked_noise_files"] = prep["cleaned_tracked_noise_files"]
             details["preexisting_commit"] = prep["preexisting_commit"]
+            if apply_scope.selected_files:
+                terminal_ui.print_kv_summary(
+                    "Scope de run/apply:",
+                    {
+                        "source": apply_scope.source,
+                        "archivos seleccionados": len(apply_scope.selected_files),
+                        "cambios seleccionados": len(selected_change_titles),
+                    },
+                )
 
             for i in range(1, config.max_iters + 1):
                 msg = aider_msg if i == 1 else (
@@ -205,7 +215,7 @@ def cmd_run(args) -> None:
                     test_details["test_timeout"] = config.test_timeout
                     test_details["validation_profile"] = test_summary.get("validation_profile")
                     test_details["summary"] = test_summary
-                    print(f"run: iter {i} tests passed={passed}")
+                    terminal_ui.print_status("ok" if passed else "warn", f"Iteracion {i}: tests passed={passed}")
                 if passed:
                     final_passed = True
                     break
@@ -218,7 +228,7 @@ def cmd_run(args) -> None:
             recorder.mark_stage_skipped("test", "no_test_report_produced")
 
         if not final_passed:
-            print("run: se agotaron las iteraciones sin conseguir un estado verde completo.")
+            terminal_ui.print_status("warn", "Se agotaron las iteraciones sin conseguir un estado verde completo.")
 
         with core.record_stage(recorder, "report") as details:
             core.clear_artifacts(ai_dir, ["final.md", "report-prompt.txt", "report-raw.txt", "report-model.md", "report-error.md"])
@@ -253,7 +263,7 @@ def cmd_run(args) -> None:
                 validation_command=test_cmd,
             )
             core.safe_write(ai_dir / "final.md", final_md)
-            print(f"run: final -> {ai_dir / 'final.md'} (base_ref={base_ref})")
+            terminal_ui.print_status("ok", f"Reporte final generado: {ai_dir / 'final.md'} (base_ref={base_ref})")
 
         print(core.explain_completed_changes(selected_change_titles, final_changed_files, test_summary.get("status")))
         result_commit = None
@@ -279,7 +289,7 @@ def cmd_run(args) -> None:
             core.read_text(ai_dir / "test-report.md"),
         )
         core.safe_write(ai_dir / "final.md", final_md)
-        print(f"run: failed during {failed_stage}. See {error_path}")
+        terminal_ui.print_human_error_summary(f"run/{failed_stage}", str(exc), error_path, hint="Revisa el artefacto de error y los reportes en AI/.")
         raise
 
     final_status = test_summary.get("status", "ok") if final_passed else test_summary.get("status", "failed")

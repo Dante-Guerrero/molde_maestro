@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
+from . import terminal_ui
 
 def _normalize_cfg_keys(cfg: Any) -> Any:
     if isinstance(cfg, dict):
@@ -217,7 +218,8 @@ def _list_ollama_models() -> list[str]:
 def _prompt_numbered_model_selection(label: str, models: list[str]) -> str:
     if not models:
         raise SystemExit(f"No pude listar modelos de Ollama para seleccionar {label}.")
-    print(f"Selecciona el modelo {label}:")
+    terminal_ui.print_section(f"Seleccion de modelo {label}")
+    terminal_ui.print_status("info", "Elige una opcion numerada.")
     for index, model in enumerate(models, start=1):
         print(f"{index}. {model}")
     while True:
@@ -226,11 +228,12 @@ def _prompt_numbered_model_selection(label: str, models: list[str]) -> str:
             selected = int(choice)
             if 1 <= selected <= len(models):
                 return f"ollama:{models[selected - 1]}"
-        print(f"Entrada inválida. Ingresa un número entre 1 y {len(models)}.", file=sys.stderr)
+        terminal_ui.print_status("warn", f"Entrada invalida. Ingresa un numero entre 1 y {len(models)}.", stream=sys.stderr)
 
 
 def _prompt_multiline_goals() -> str:
-    print("No se encontró el archivo de goals. Pega las instrucciones y finaliza con una línea que contenga solo END.")
+    terminal_ui.print_section("Goals interactivos")
+    terminal_ui.print_status("info", "No se encontro el archivo de goals. Pega las instrucciones y finaliza con una linea END.")
     lines: list[str] = []
     while True:
         line = input()

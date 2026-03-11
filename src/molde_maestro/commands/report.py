@@ -4,6 +4,7 @@ import json
 
 from .. import pipeline as core
 from ..command_config import ReportCommandConfig
+from .. import terminal_ui
 
 
 def cmd_report(args) -> None:
@@ -50,7 +51,7 @@ def cmd_report(args) -> None:
                 git_diff,
             )
             core.safe_write(ai_dir / "final.md", final_md)
-            print(f"report: wrote {ai_dir / 'final.md'} (base_ref={base_ref})")
+            terminal_ui.print_status("ok", f"Reporte final generado: {ai_dir / 'final.md'} (base_ref={base_ref})")
     except BaseException as exc:
         error_path = core.write_stage_error(ai_dir, "report", exc, {"report_timeout": core.effective_report_timeout(config._raw_args)})
         recorder.fail_run(
@@ -58,6 +59,6 @@ def cmd_report(args) -> None:
             "timeout" if isinstance(exc, core.ExecutionFailure) and exc.status == "timeout" else "failed",
             {"stage": "report", "error_path": str(error_path)},
         )
-        print(f"report: failed. See {error_path}")
+        terminal_ui.print_human_error_summary("report", str(exc), error_path, hint="Revisa el artefacto de error para diagnostico detallado.")
         raise
     recorder.complete_run("ok", {"final_report": str(ai_dir / "final.md")})

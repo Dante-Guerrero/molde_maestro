@@ -1,15 +1,18 @@
 import argparse
+import io
 import json
 import os
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from molde_maestro import pipeline
+from molde_maestro import terminal_ui
 
 
 class NormalizeModelMarkdownTests(unittest.TestCase):
@@ -40,6 +43,25 @@ class NormalizeModelMarkdownTests(unittest.TestCase):
         )
 
 
+class TerminalUiTests(unittest.TestCase):
+    @mock.patch("builtins.input", return_value="y")
+    def test_confirm_action_accepts_yes(self, _mock_input: mock.Mock) -> None:
+        self.assertTrue(terminal_ui.confirm_action("Continuar?"))
+
+    @mock.patch("builtins.input", return_value="")
+    def test_confirm_action_defaults_to_no(self, _mock_input: mock.Mock) -> None:
+        self.assertFalse(terminal_ui.confirm_action("Continuar?"))
+
+    def test_print_human_error_summary_includes_hint_and_path(self) -> None:
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            terminal_ui.print_human_error_summary("apply", "fallo", "/tmp/error.md", hint="Revisa el artefacto.")
+        output = buffer.getvalue()
+        self.assertIn("apply: fallo", output)
+        self.assertIn("Revisa el artefacto.", output)
+        self.assertIn("/tmp/error.md", output)
+
+
 class CliInteractionTests(unittest.TestCase):
     @mock.patch("sys.stdin.isatty", return_value=True)
     @mock.patch("builtins.input", side_effect=["2"])
@@ -65,8 +87,10 @@ class CliInteractionTests(unittest.TestCase):
 
     @mock.patch("sys.stdin.isatty", return_value=True)
     @mock.patch("builtins.input", side_effect=["Implementa cambio A", "END"])
+    @mock.patch("builtins.print")
     def test_complete_interactive_args_collects_goals_when_file_is_missing(
         self,
+        mock_print: mock.Mock,
         _mock_input: mock.Mock,
         _mock_isatty: mock.Mock,
     ) -> None:
@@ -85,6 +109,34 @@ class CliInteractionTests(unittest.TestCase):
 
             self.assertEqual(resolved.goals_text, "Implementa cambio A")
             self.assertTrue(resolved._interactive_goals_text)
+            printed = " ".join(str(call.args[0]) for call in mock_print.call_args_list if call.args)
+            self.assertIn("Goals interactivos", printed)
+
+    @mock.patch("sys.stdin.isatty", return_value=True)
+    @mock.patch("builtins.input", side_effect=["2"])
+    @mock.patch("molde_maestro.cli._list_ollama_models", return_value=["deepseek-r1", "qwen2.5-coder:14b"])
+    @mock.patch("builtins.print")
+    def test_complete_interactive_args_prints_guided_model_selection(
+        self,
+        mock_print: mock.Mock,
+        _mock_models: mock.Mock,
+        _mock_input: mock.Mock,
+        _mock_isatty: mock.Mock,
+    ) -> None:
+        args = argparse.Namespace(
+            cmd="plan",
+            repo=".",
+            goals="PROJECT_GOALS.md",
+            goals_text="already set",
+            reasoner="",
+            aider_model="",
+        )
+
+        pipeline.cli_module.complete_interactive_args(args)
+
+        printed = " ".join(str(call.args[0]) for call in mock_print.call_args_list if call.args)
+        self.assertIn("Seleccion de modelo reasoner", printed)
+        self.assertIn("Elige una opcion numerada.", printed)
 
 
 class LoadConfigFileTests(unittest.TestCase):
@@ -984,6 +1036,20 @@ class ValidationProfileTests(unittest.TestCase):
 
 
 class RunRecorderTests(unittest.TestCase):
+    def test_prints_human_stage_status_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ai_dir = Path(tmpdir)
+            recorder = pipeline.RunRecorder(ai_dir=ai_dir, command="run", repo=ai_dir)
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                recorder.start_stage("apply")
+                recorder.finish_stage("apply", "ok", {"artifact": "x"})
+            output = buffer.getvalue()
+        self.assertIn("[INFO]", output)
+        self.assertIn("[apply] Iniciando", output)
+        self.assertIn("[OK]", output)
+        self.assertIn("[apply] OK en", output)
+
     def test_persists_stage_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             ai_dir = Path(tmpdir)

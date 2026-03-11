@@ -4,6 +4,7 @@ from pathlib import Path
 
 from .. import pipeline as core
 from ..command_config import SnapshotCommandConfig
+from .. import terminal_ui
 
 
 def cmd_snapshot(args) -> None:
@@ -12,7 +13,7 @@ def cmd_snapshot(args) -> None:
     core.preflight(config._raw_args, repo)
 
     if not config.zip_enabled:
-        print("snapshot: --zip no está activado; no se creó zip.")
+        terminal_ui.print_status("warn", "Snapshot omitido: --zip no esta activado.")
         recorder.mark_stage_skipped("snapshot", "zip_disabled")
         recorder.complete_run("ok", {"snapshot_created": False})
         return
@@ -24,5 +25,5 @@ def cmd_snapshot(args) -> None:
 
         core.git_archive_zip(repo, out_zip, ref=config.ref)
         details["artifact"] = str(out_zip)
-        print(f"snapshot: wrote {out_zip}")
+        terminal_ui.print_status("ok", f"Snapshot generado: {out_zip}")
     recorder.complete_run("ok", {"snapshot_created": True})
